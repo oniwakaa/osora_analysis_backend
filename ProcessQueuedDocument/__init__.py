@@ -9,6 +9,7 @@ import io
 import ast  # Still needed for potential future use, but not strictly required by removed code
 from typing import Dict, Any, Optional, List, Tuple, Union
 import asyncio # Import asyncio for potential sleeps
+import urllib.parse
 
 import azure.functions as func
 import httpx
@@ -506,11 +507,185 @@ async def get_sharepoint_metadata(drive_id: str, item_id: str, access_token: str
     return sharepoint_fields
 
 
-# --- Modified `generate_dynamic_prompt` to remove search_context ---
+# --- Helper Function: User ID Retrieval ---
+async def get_user_id_from_email(email: str, access_token: str) -> Optional[str]:
+    """
+    Retrieves the Azure AD user ID for a given email address via Microsoft Graph API.
+    
+    Args:
+        email: The email address of the user
+        access_token: Microsoft Graph API access token
+        
+    Returns:
+        str: User ID if exactly one user is found, None otherwise
+    """
+    if not email or not access_token:
+        logging.warning(f"User ID Lookup: Missing required parameters - Email: {'present' if email else 'missing'}, Token: {'present' if access_token else 'missing'}")
+        return None
+    
+    try:
+        # URL encode the email properly for the filter query
+        encoded_email = urllib.parse.quote(email)
+        user_url = f"{GRAPH_API_ENDPOINT}/users?$filter=mail eq '{encoded_email}'&$select=id"
+        
+        logging.info(f"User ID Lookup: Querying Graph API for user with email: {email}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                user_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                users = user_data.get('value', [])
+                
+                if len(users) == 1:
+                    user_id = users[0].get('id')
+                    logging.info(f"User ID Lookup: Successfully retrieved ID for email {email}: {user_id}")
+                    return user_id
+                elif len(users) == 0:
+                    logging.warning(f"User ID Lookup: No user found with email {email}")
+                    return None
+                else:
+                    logging.warning(f"User ID Lookup: Multiple users ({len(users)}) found with email {email}")
+                    return None
+            else:
+                logging.error(f"User ID Lookup: Failed with status code {response.status_code}")
+                if response.text:
+                    logging.error(f"User ID Lookup: Error response: {response.text[:500]}")
+                return None
+                
+    except Exception as e:
+        logging.error(f"User ID Lookup: Error retrieving user ID for email {email}: {str(e)}", exc_info=True)
+        return None
+
+
+# --- Helper Function: Planner Tasks Retrieval ---
+async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves Planner tasks assigned to a user from Microsoft Graph API.
+    
+    Args:
+        user_id: The Azure AD user ID
+        access_token: Microsoft Graph API access token
+        
+    Returns:
+        List[Dict[str, Any]]: List of task dictionaries containing details
+    """
+    if not user_id or not access_token:
+        logging.warning(f"Planner Tasks: Missing required parameters - User ID: {'present' if user_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
+        return []
+    
+    try:
+        # Construct API URL to get tasks assigned to the specific user
+        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignments/any(a:a/assigneeId eq '{user_id}')&$expand=details"
+        
+        logging.info(f"Planner Tasks: Querying Graph API for tasks assigned to user: {user_id}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                tasks_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                tasks_data = response.json()
+                tasks = tasks_data.get('value', [])
+                
+                # Process and structure the task data
+                formatted_tasks = []
+                for task in tasks:
+                    task_details = task.get('details', {})
+                    
+                    formatted_task = {
+                        "id": task.get('id'),
+                        "title": task.get('title'),
+                        "percentComplete": task.get('percentComplete'),
+                        "createdDateTime": task.get('createdDateTime'),
+                        "dueDateTime": task.get('dueDateTime'),
+                        "completedDateTime": task.get('completedDateTime'),
+                        "description": task_details.get('description', ''),
+                        "priority": task.get('priority'),
+                        "planTitle": "",  # Will be populated below if possible
+                        "bucketName": ""  # Will be populated below if possible
+                    }
+                    
+                    # Add task to the formatted list
+                    formatted_tasks.append(formatted_task)
+                
+                logging.info(f"Planner Tasks: Retrieved {len(formatted_tasks)} tasks for user {user_id}")
+                
+                # Try to enrich with plan and bucket names if tasks exist
+                if formatted_tasks:
+                    try:
+                        # Get a sample task to fetch plan and bucket details
+                        sample_task = tasks[0]
+                        plan_id = sample_task.get('planId')
+                        bucket_id = sample_task.get('bucketId')
+                        
+                        if plan_id:
+                            # Get plan details
+                            plan_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}"
+                            plan_response = await client.get(
+                                plan_url,
+                                headers={"Authorization": f"Bearer {access_token}"},
+                                timeout=30
+                            )
+                            
+                            if plan_response.status_code == 200:
+                                plan_data = plan_response.json()
+                                plan_title = plan_data.get('title', '')
+                                
+                                # Update all tasks with the plan title
+                                for task in formatted_tasks:
+                                    task["planTitle"] = plan_title
+                                
+                                logging.info(f"Planner Tasks: Enriched tasks with plan title: {plan_title}")
+                        
+                        if bucket_id:
+                            # Get bucket details
+                            bucket_url = f"{GRAPH_API_ENDPOINT}/planner/buckets/{bucket_id}"
+                            bucket_response = await client.get(
+                                bucket_url,
+                                headers={"Authorization": f"Bearer {access_token}"},
+                                timeout=30
+                            )
+                            
+                            if bucket_response.status_code == 200:
+                                bucket_data = bucket_response.json()
+                                bucket_name = bucket_data.get('name', '')
+                                
+                                # Update tasks in this bucket
+                                for task in formatted_tasks:
+                                    if sample_task.get('bucketId') == bucket_id:
+                                        task["bucketName"] = bucket_name
+                                
+                                logging.info(f"Planner Tasks: Enriched tasks with bucket name: {bucket_name}")
+                    
+                    except Exception as enrich_err:
+                        logging.warning(f"Planner Tasks: Error enriching tasks with plan/bucket details: {str(enrich_err)}")
+                        # Continue without enrichment - we still have the basic task data
+                
+                return formatted_tasks
+            else:
+                logging.error(f"Planner Tasks: Failed with status code {response.status_code}")
+                if response.text:
+                    logging.error(f"Planner Tasks: Error response: {response.text[:500]}")
+                return []
+                
+    except Exception as e:
+        logging.error(f"Planner Tasks: Error retrieving tasks for user {user_id}: {str(e)}", exc_info=True)
+        return []
+
+
 async def generate_dynamic_prompt(
     content_sample: str, 
     file_type: str,
-    sharepoint_custom_metadata: Optional[Dict[str, Any]] = None
+    sharepoint_custom_metadata: Optional[Dict[str, Any]] = None,
+    employee_planner_tasks: Optional[List[Dict[str, Any]]] = None
 ) -> str:
     """
     Generate a dynamic prompt for Claude based on document content.
@@ -519,6 +694,7 @@ async def generate_dynamic_prompt(
         content_sample: The document content in markdown format
         file_type: The file extension (type) of the document
         sharepoint_custom_metadata: Optional SharePoint custom metadata for context enhancement
+        employee_planner_tasks: Optional list of employee's planner tasks for context
         
     Returns:
         str: Generated prompt for Claude or error indicator
@@ -542,6 +718,16 @@ SHAREPOINT CUSTOM METADATA:
 
 Use this metadata (which may include author, dates, categories, or custom fields) to enhance your understanding of the document context.
 """
+
+        # Generate planner tasks section if available
+        planner_tasks_section = ""
+        if employee_planner_tasks and len(employee_planner_tasks) > 0:
+            planner_tasks_section = f"""
+EMPLOYEE PLANNER TASKS:
+{json.dumps(employee_planner_tasks, indent=2)}
+
+These are the current planner tasks assigned to the document author/owner. Use this information to understand the employee's current projects, priorities, and deadlines when analyzing the document.
+"""
         
         # Create the meta-prompt for Gemini (removed reference to Web Search Context)
         meta_prompt = f"""
@@ -564,11 +750,13 @@ Use this metadata (which may include author, dates, categories, or custom fields
             1.  Document File Type: {file_type}
             2.  Document Content Sample: ```{content_sample}```
             {metadata_section}
+            {planner_tasks_section}
 
             Your Task (Generate the Claude Prompt - Output ONLY the prompt string):
 
             STEP 1: Analyze Inputs & Infer Purpose:
             - Examine the File Type ({file_type}), Content Sample, and any SharePoint Custom Metadata.
+            - If employee planner tasks are available, consider how the document might relate to the employee's current work.
             - Infer the document's primary purpose and category (e.g., Technical Specification, Financial Report, Project Plan, Marketing Copy, Competitor Analysis, Legal Document, Academic Paper, Code Snippet etc.).
 
             STEP 2: Define Adaptive Technical Metrics for Claude:
@@ -583,6 +771,7 @@ Use this metadata (which may include author, dates, categories, or custom fields
 
             STEP 3: Determine Analysis Focus for Claude:
             - Based on Step 1, decide the main focus for Claude's analysis.
+            - If employee planner tasks are available, instruct Claude to note any connections between the document and the tasks.
             - *Example:* For a technical document, the generated prompt should emphasize analysis of technical depth and accuracy. For a business proposal, emphasize clarity, argument strength, and market awareness. For a spreadsheet, emphasize data structure and formula analysis.
 
             STEP 4: Construct the Prompt for Claude:
@@ -593,13 +782,14 @@ Use this metadata (which may include author, dates, categories, or custom fields
             - IMPORTANT: Explicitly instruct Claude NOT to include a 'metadata' section in its output - the metadata is provided for context only.
             - **Most Importantly:** When instructing Claude about the "technical_scores", list the *specific, adaptive metrics* you chose in Step 2 and ask for the 1-10 score and reasoning for *each of those specific metrics*.
             - Tailor the instructions for the "summary", "content_analysis", and "recommendations" sections to align with the inferred document purpose identified in Step 1 and the focus determined in Step 3.
+            - If employee planner tasks are provided, instruct Claude to consider these when forming recommendations - they may suggest improvements that align with the employee's current priorities or deadlines.
 
             Output Format Restriction: Your final output must be ONLY the generated prompt string for Claude. Do not include explanations, introductions, or apologies. Start the output directly with the prompt text for Claude.
 
             Generate the tailored prompt for Claude now:
         """
         
-        logging.info(f"Gemini: Generating dynamic prompt for {file_type} document with custom metadata: {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} fields")
+        logging.info(f"Gemini: Generating dynamic prompt for {file_type} document with custom metadata: {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} fields and {len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")
         
         response = await gemini_model.generate_content_async(meta_prompt)
         
@@ -620,12 +810,13 @@ Use this metadata (which may include author, dates, categories, or custom fields
         return error_msg
 
 
-# --- Modified to include SharePoint metadata ---
+# --- Modified to include SharePoint metadata and Planner tasks ---
 async def analyze_with_claude_context_prompt(
     content: str, 
     dynamic_prompt: str, 
     file_name: str,
-    sharepoint_custom_metadata: Optional[Dict[str, Any]] = None
+    sharepoint_custom_metadata: Optional[Dict[str, Any]] = None,
+    employee_planner_tasks: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """ 
     Analyzes document markdown content using Claude with dynamic prompt. 
@@ -635,6 +826,7 @@ async def analyze_with_claude_context_prompt(
         dynamic_prompt: Generated dynamic prompt from Gemini
         file_name: Name of the file being analyzed
         sharepoint_custom_metadata: Optional SharePoint custom metadata for context enhancement
+        employee_planner_tasks: Optional list of employee's planner tasks for context
     
     Returns:
         Dict containing analysis results or error information
@@ -656,7 +848,7 @@ async def analyze_with_claude_context_prompt(
             logging.warning(f"Claude Analysis: Truncating content from {len(content)} to {MAX_CHARS_FOR_ANALYSIS} characters.")
             content_to_analyze = content[:MAX_CHARS_FOR_ANALYSIS]
 
-        logging.info(f"Claude Analysis: Sending {len(content_to_analyze)} characters for analysis with {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} custom metadata fields.")
+        logging.info(f"Claude Analysis: Sending {len(content_to_analyze)} characters for analysis with {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} custom metadata fields and {len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")
 
         system_prompt = "You are an AI document analyst executing the user's request precisely. Respond ONLY with a valid JSON object matching the requested structure, with no surrounding text or markdown."
         
@@ -666,6 +858,16 @@ async def analyze_with_claude_context_prompt(
             metadata_section = f"""
 SHAREPOINT CUSTOM METADATA:
 {json.dumps(sharepoint_custom_metadata, indent=2)}
+"""
+
+        # Generate planner tasks section if available
+        planner_tasks_section = ""
+        if employee_planner_tasks and len(employee_planner_tasks) > 0:
+            planner_tasks_section = f"""
+EMPLOYEE PLANNER TASKS:
+{json.dumps(employee_planner_tasks, indent=2)}
+
+Consider the author's current tasks and priorities when analyzing this document.
 """
         
         user_message = ""
@@ -677,6 +879,7 @@ SHAREPOINT CUSTOM METADATA:
             Please analyze the following document content in markdown format and generate a structured analysis.
             
             {metadata_section}
+            {planner_tasks_section}
             
             DOCUMENT CONTENT:
             {content_to_analyze}
@@ -695,6 +898,7 @@ SHAREPOINT CUSTOM METADATA:
             # Use dynamic prompt with metadata section
             user_message = f"""
             {metadata_section}
+            {planner_tasks_section}
             
             DOCUMENT CONTENT:
             {content_to_analyze}
@@ -817,6 +1021,8 @@ async def main(msg: func.QueueMessage) -> None:
     sharepoint_fields = {} # Initialize SharePoint metadata
     sharepoint_custom_metadata = {} # Initialize custom SharePoint metadata
     sharepoint_internal_metadata = {} # Initialize internal SharePoint metadata
+    employee_user_id = None # Initialize employee user ID
+    employee_planner_tasks = [] # Initialize employee planner tasks
 
     logging.info(f"{msg_id}: ----- Function execution started -----")
 
@@ -947,6 +1153,100 @@ async def main(msg: func.QueueMessage) -> None:
             logging.warning(f"{msg_id}: Error retrieving SharePoint metadata (continuing without it): {metadata_err}")
             # We continue processing even if metadata retrieval fails
             
+        # --- Fetch Employee Planner Tasks (New Step) ---
+        try:
+            # Extract author email from SharePoint metadata if available
+            author_email = None
+            
+            # Common SharePoint author field names with their typical encoding in Graph API responses
+            # These need to be adjusted based on your specific SharePoint column names
+            potential_author_fields = [
+                "Autore_x002f_i",  # "Author/s" in Italian SharePoint
+                "Author0",         # Sometimes used for Author
+                "EditorId",        # Editor reference
+                "Created_x0020_By" # Created By field
+            ]
+            
+            logging.info(f"{msg_id}: Attempting to extract author email from SharePoint metadata with keys: {list(sharepoint_custom_metadata.keys())}")
+            
+            # Check for author fields that might contain the email
+            for field_name in potential_author_fields:
+                if field_name in sharepoint_custom_metadata:
+                    field_value = sharepoint_custom_metadata[field_name]
+                    logging.info(f"{msg_id}: Found potential author field '{field_name}' with value type: {type(field_value)}")
+                    
+                    try:
+                        # Case 1: Value is a list containing dictionaries (common SharePoint person field format)
+                        if isinstance(field_value, list) and len(field_value) > 0:
+                            first_entry = field_value[0]
+                            logging.info(f"{msg_id}: Field '{field_name}' contains a list with first entry type: {type(first_entry)}")
+                            
+                            if isinstance(first_entry, dict):
+                                # Try to extract email from various possible keys
+                                for email_key in ['Email', 'email', 'EMail', 'EmailAddress', 'UserEmail']:
+                                    if email_key in first_entry and first_entry[email_key]:
+                                        author_email = first_entry[email_key]
+                                        logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}[0].{email_key}'")
+                                        break
+                                
+                                # If no direct email key, try LookupValue which might contain email
+                                if not author_email and 'LookupValue' in first_entry:
+                                    lookup_value = first_entry['LookupValue']
+                                    if isinstance(lookup_value, str) and '@' in lookup_value:
+                                        author_email = lookup_value
+                                        logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}[0].LookupValue'")
+                        
+                        # Case 2: Value is a dictionary (another common format)
+                        elif isinstance(field_value, dict):
+                            # Try to extract email from various possible keys
+                            for email_key in ['Email', 'email', 'EMail', 'EmailAddress', 'UserEmail']:
+                                if email_key in field_value and field_value[email_key]:
+                                    author_email = field_value[email_key]
+                                    logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}.{email_key}'")
+                                    break
+                        
+                        # Case 3: Value is a string that might be an email
+                        elif isinstance(field_value, str) and '@' in field_value:
+                            author_email = field_value
+                            logging.info(f"{msg_id}: Field '{field_name}' directly contains what appears to be an email: '{author_email}'")
+                        
+                        # If we found an email, no need to check other fields
+                        if author_email:
+                            break
+                            
+                    except Exception as extract_err:
+                        logging.warning(f"{msg_id}: Error extracting email from field '{field_name}': {extract_err}")
+                        continue
+            
+            # If no email found through specific fields, dump the metadata for debugging
+            if not author_email:
+                logging.info(f"{msg_id}: Could not identify author email from metadata. Available fields: {list(sharepoint_custom_metadata.keys())}")
+                logging.debug(f"{msg_id}: Full SharePoint custom metadata for debugging: {json.dumps(sharepoint_custom_metadata)}")
+            
+            if author_email:
+                # Get the user ID for the author
+                employee_user_id = await get_user_id_from_email(author_email, access_token)
+                
+                if employee_user_id:
+                    logging.info(f"{msg_id}: Retrieved user ID for author: {employee_user_id}")
+                    
+                    # Get the planner tasks for the author
+                    employee_planner_tasks = await get_employee_planner_tasks(employee_user_id, access_token)
+                    
+                    if employee_planner_tasks:
+                        logging.info(f"{msg_id}: Retrieved {len(employee_planner_tasks)} planner tasks for author")
+                    else:
+                        logging.info(f"{msg_id}: No planner tasks found for author")
+                else:
+                    logging.info(f"{msg_id}: Could not retrieve user ID for author email: {author_email}")
+            else:
+                logging.info(f"{msg_id}: No author email found in SharePoint metadata")
+                
+        except Exception as planner_err:
+            logging.warning(f"{msg_id}: Error retrieving employee planner tasks (continuing without them): {planner_err}")
+            # We continue processing even if planner task retrieval fails
+            employee_planner_tasks = []
+
         # --- Lease Lock Acquisition (NEW STEP) ---
         logging.info(f"{msg_id}: Attempting to acquire processing lock.")
         # Ensure safe_item_id calculation happens here if not already present before this block
@@ -1013,21 +1313,21 @@ async def main(msg: func.QueueMessage) -> None:
 
 
                         # Step 2: Generate dynamic prompt with Gemini
-                        # ... (Gemini prompt generation logic remains the same) ...
                         dynamic_prompt = await generate_dynamic_prompt(
                             content_sample=markdown_content,
                             file_type=file_extension,
-                            sharepoint_custom_metadata=sharepoint_custom_metadata
+                            sharepoint_custom_metadata=sharepoint_custom_metadata,
+                            employee_planner_tasks=employee_planner_tasks
                         )
                         # Allow fallback if Gemini fails, maybe log warning but don't fail unless critical
 
                         # Step 3: Analyze with Claude using dynamic prompt
-                        # ... (Claude analysis logic remains the same) ...
                         analysis_result = await analyze_with_claude_context_prompt(
                             content=markdown_content,
                             dynamic_prompt=dynamic_prompt,
                             file_name=file_name,
-                            sharepoint_custom_metadata=sharepoint_custom_metadata
+                            sharepoint_custom_metadata=sharepoint_custom_metadata,
+                            employee_planner_tasks=employee_planner_tasks
                         )
                         if analysis_result is None or (isinstance(analysis_result, dict) and analysis_result.get("error")):
                             final_status = "claude_analysis_error"
@@ -1051,6 +1351,7 @@ async def main(msg: func.QueueMessage) -> None:
                             "analysis_output": analysis_result,
                             "sharepoint_custom_metadata": sharepoint_custom_metadata,
                             "sharepoint_internal_metadata": sharepoint_internal_metadata,
+                            "employee_planner_tasks": employee_planner_tasks,
                             "metadata": item_metadata,
                             "processing_duration_seconds": (pendulum.now('UTC') - function_start_time).total_seconds(),
                             "timestamp_utc": pendulum.now('UTC').to_iso8601_string()
@@ -1079,6 +1380,7 @@ async def main(msg: func.QueueMessage) -> None:
                             "metadata": item_metadata,
                             "sharepoint_custom_metadata": sharepoint_custom_metadata,
                             "sharepoint_internal_metadata": sharepoint_internal_metadata,
+                            "employee_planner_tasks": employee_planner_tasks,
                             "intermediate_markdown_sample": (markdown_content[:1000] + "..." if isinstance(markdown_content, str) and len(markdown_content) > 1000 else markdown_content) if markdown_content else None,
                             "dynamic_prompt": dynamic_prompt[:1000] + "..." if dynamic_prompt and len(dynamic_prompt) > 1000 else dynamic_prompt,
                             "raw_claude_response": analysis_result.get("raw_response", None) if isinstance(analysis_result, dict) and "raw_response" in analysis_result else None,
