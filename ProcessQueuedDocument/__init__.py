@@ -406,6 +406,7 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
                 raise # Re-raise other errors
 
         lock_blob_client = lock_container_client.get_blob_client(blob_name)
+        logging.info(f"Lease Lock Debug: Type of lock_blob_client: {type(lock_blob_client)}")
 
         # 1. Try to create the blob if it doesn't exist (atomic operation)
         try:
@@ -419,10 +420,30 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
                  logging.error(f"Lease Lock: Error checking/creating lock blob '{blob_name}': {ex}", exc_info=True)
                  return None # Cannot proceed if blob check/creation fails unexpectedly
 
-        # 2. Attempt to acquire the lease
-        lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
-        logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' on '{blob_name}'.")
-        return lease.id # Return the lease ID
+        # 2. Attempt to acquire the lease using BlobLeaseClient
+        from azure.storage.blob.aio import BlobLeaseClient
+        lease_client = BlobLeaseClient(client=lock_blob_client)
+        logging.info(f"Lease Lock Debug: Created lease client of type {type(lease_client)}")
+        
+        try:
+            # Acquire the lease using the lease client
+            lease = await lease_client.acquire(lease_duration=lease_duration)
+            logging.info(f"Lease Lock: Successfully acquired lease '{lease}' on '{blob_name}'.")
+            return lease # Return the lease ID
+        except AttributeError as attr_err:
+            # Handle AttributeError in case the acquire method is not found
+            logging.error(f"Lease Lock: AttributeError when acquiring lease: {attr_err}. This might be a SDK version issue.")
+            # Fallback attempt to use blob client directly
+            try:
+                lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
+                logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' using fallback method.")
+                return lease.id # Return the lease ID
+            except AttributeError as fallback_err:
+                logging.error(f"Lease Lock: Fallback method also failed with AttributeError: {fallback_err}")
+                return None
+            except Exception as fallback_ex:
+                logging.error(f"Lease Lock: Fallback attempt failed: {fallback_ex}")
+                return None
 
     except HttpResponseError as ex:
         if ex.status_code == 409: # Conflict - Lease already present
@@ -446,11 +467,31 @@ async def release_blob_lease(blob_service_client: BlobServiceClient, container_n
         return
     
     try:
+        # Get the blob client first
         lock_blob_client = blob_service_client.get_blob_client(container_name, blob_name)
-        logging.info(f"Lease Lock Debug: Type of lock_blob_client before break: {type(lock_blob_client)}")
-        logging.debug(f"Lease Lock Debug: Attributes of lock_blob_client: {dir(lock_blob_client)}")
-        await lock_blob_client.break_lease(lease_id=lease_id)  # Changed from release_lease to break_lease with named parameter
-        logging.info(f"Lease Lock: Successfully released lease '{lease_id}' on '{blob_name}'.")
+        logging.info(f"Lease Lock Debug: Type of lock_blob_client: {type(lock_blob_client)}")
+        
+        # Create a BlobLeaseClient from the blob client
+        from azure.storage.blob.aio import BlobLeaseClient
+        lease_client = BlobLeaseClient(client=lock_blob_client, lease_id=lease_id)
+        logging.info(f"Lease Lock Debug: Created lease client of type {type(lease_client)}")
+        
+        try:
+            # Break the lease using the lease client
+            await lease_client.break_lease()
+            logging.info(f"Lease Lock: Successfully released lease '{lease_id}' on '{blob_name}'.")
+        except AttributeError as attr_err:
+            # Handle AttributeError in case the lease break method is not found
+            logging.error(f"Lease Lock: AttributeError when breaking lease: {attr_err}. This might be a SDK version issue.")
+            # Fallback attempt to use blob client directly
+            try:
+                await lock_blob_client.break_lease(lease_id=lease_id)
+                logging.info(f"Lease Lock: Successfully broke lease using fallback method.")
+            except AttributeError as fallback_err:
+                logging.error(f"Lease Lock: Fallback method also failed with AttributeError: {fallback_err}")
+            except Exception as fallback_ex:
+                logging.error(f"Lease Lock: Fallback attempt failed: {fallback_ex}")
+        
         # Optional: Delete the lock blob after releasing the lease if desired
         # try:
         #     await lock_blob_client.delete_blob(lease_id=lease_id) # Must provide lease ID if just released
@@ -586,16 +627,15 @@ async def get_employee_planner_tasks(plan_id: Optional[str], user_id: str, acces
         logging.warning(f"Planner Tasks: Missing required parameters - User ID: {'present' if user_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
         return []
     
+    # Early return if plan_id is not provided
+    if not plan_id:
+        logging.warning("Planner Tasks: Plan ID is required. Skipping task retrieval.")
+        return []
+    
     try:
-        # Construct API URL based on whether we have a plan_id
-        if plan_id:
-            # If we have a plan_id, get tasks from that specific plan and expand details and assignments
-            tasks_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}/tasks?$expand=details,assignments"
-            logging.info(f"Planner Tasks: Querying Graph API for tasks in plan: {plan_id}")
-        else:
-            # If no plan_id, fall back to getting all tasks assigned to the user
-            tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignedToUser eq '{user_id}'&$expand=details"
-            logging.info(f"Planner Tasks: Querying Graph API for tasks assigned to user: {user_id}")
+        # Construct API URL for the specific plan and expand details and assignments
+        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}/tasks?$expand=details,assignments"
+        logging.info(f"Planner Tasks: Querying Graph API for tasks in plan: {plan_id}")
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -612,36 +652,30 @@ async def get_employee_planner_tasks(plan_id: Optional[str], user_id: str, acces
                 formatted_tasks = []
                 
                 for task in tasks:
-                    # If we queried by plan, we need to check if this task is assigned to our user
-                    if plan_id:
-                        # Get the assignments dictionary
-                        assignments = task.get('assignments', {})
-                        # Check if our user is in the assignments
-                        if not any(assignment.get('assignedTo', {}).get('user', {}).get('id') == user_id 
-                                   for assignment in assignments.values() if isinstance(assignment, dict)):
-                            # Skip tasks not assigned to our user
-                            continue
+                    # Get assignments dictionary, default to empty
+                    assignments = task.get('assignments', {})
                     
-                    task_details = task.get('details', {})
-                    
-                    formatted_task = {
-                        "id": task.get('id'),
-                        "title": task.get('title'),
-                        "percentComplete": task.get('percentComplete'),
-                        "createdDateTime": task.get('createdDateTime'),
-                        "dueDateTime": task.get('dueDateTime'),
-                        "completedDateTime": task.get('completedDateTime'),
-                        "description": task_details.get('description', ''),
-                        "priority": task.get('priority'),
-                        "planTitle": "",  # Will be populated below if possible
-                        "bucketName": ""  # Will be populated below if possible
-                    }
-                    
-                    # Add task to the formatted list
-                    formatted_tasks.append(formatted_task)
+                    # Only include tasks where user_id is a direct key in the assignments dictionary
+                    if user_id in assignments:
+                        task_details = task.get('details', {})
+                        
+                        formatted_task = {
+                            "id": task.get('id'),
+                            "title": task.get('title'),
+                            "percentComplete": task.get('percentComplete'),
+                            "createdDateTime": task.get('createdDateTime'),
+                            "dueDateTime": task.get('dueDateTime'),
+                            "completedDateTime": task.get('completedDateTime'),
+                            "description": task_details.get('description', ''),
+                            "priority": task.get('priority'),
+                            "planTitle": "",  # Will be populated below if possible
+                            "bucketName": ""  # Will be populated below if possible
+                        }
+                        
+                        # Add task to the formatted list
+                        formatted_tasks.append(formatted_task)
                 
-                logging.info(f"Planner Tasks: Retrieved {len(formatted_tasks)} tasks for user {user_id}" + 
-                            (f" in plan {plan_id}" if plan_id else ""))
+                logging.info(f"Planner Tasks: Retrieved {len(formatted_tasks)} tasks for user {user_id} in plan {plan_id}")
                 
                 # Try to enrich with plan and bucket names if tasks exist
                 if formatted_tasks:
@@ -1329,19 +1363,21 @@ async def main(msg: func.QueueMessage) -> None:
                     logging.info(f"{msg_id}: Retrieved user ID for author: {employee_user_id}")
                     
                     # Get the planner tasks for the author
-                    if plan_id:
-                        # If we have a plan_id from the site, use it to filter tasks
-                        logging.info(f"{msg_id}: Using Plan ID from site to get tasks: {plan_id}")
-                        employee_planner_tasks = await get_employee_planner_tasks(plan_id, employee_user_id, access_token)
-                    else:
-                        # Otherwise fall back to getting all tasks for the user
-                        logging.info(f"{msg_id}: No Plan ID available, getting all tasks for user")
-                        employee_planner_tasks = await get_employee_planner_tasks(None, employee_user_id, access_token)
-                    
-                    if employee_planner_tasks:
-                        logging.info(f"{msg_id}: Retrieved {len(employee_planner_tasks)} planner tasks for author")
-                    else:
-                        logging.info(f"{msg_id}: No planner tasks found for author")
+                    if employee_user_id and plan_id:
+                        # If we have both plan_id and employee_user_id, fetch tasks
+                        logging.info(f"{msg_id}: Attempting to retrieve planner tasks for user {employee_user_id} in plan {plan_id}")
+                        employee_planner_tasks = await get_employee_planner_tasks(
+                            plan_id=plan_id,
+                            user_id=employee_user_id, 
+                            access_token=access_token
+                        )
+                        
+                        if employee_planner_tasks:
+                            logging.info(f"{msg_id}: Retrieved {len(employee_planner_tasks)} planner tasks for author")
+                        else:
+                            logging.info(f"{msg_id}: No planner tasks found for author in plan {plan_id}")
+                    elif not plan_id:
+                        logging.info(f"{msg_id}: Skipping Planner task fetch because no Plan ID was derived from the Group.")
                 else:
                     logging.info(f"{msg_id}: Could not retrieve user ID for author email: {author_email}")
             else:
@@ -1519,7 +1555,11 @@ async def main(msg: func.QueueMessage) -> None:
         finally:
             if lease_id and lock_blob_name and blob_service_client: # Check blob_service_client again
                  logging.info(f"{msg_id}: Releasing lock lease '{lease_id}' for blob '{lock_blob_name}'.")
-                 await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+                 try:
+                     await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+                     logging.debug(f"{msg_id}: Successfully released lock lease '{lease_id}'")
+                 except Exception as release_err:
+                     logging.error(f"{msg_id}: Error releasing lock lease: {release_err}")
                  lease_id = None # Clear lease ID after attempting release
             elif lease_id:
                  logging.error(f"{msg_id}: Cannot release lease '{lease_id}' because blob service client is not available.")
@@ -1540,7 +1580,11 @@ async def main(msg: func.QueueMessage) -> None:
                  # But as a safeguard, check again.
                  if lease_id and lock_blob_name:
                       logging.warning(f"{msg_id}: Releasing lock due to top-level error (outer handler).")
-                      await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+                      try:
+                          await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+                          logging.debug(f"{msg_id}: Successfully released lock lease '{lease_id}' in error handler")
+                      except Exception as release_err:
+                          logging.error(f"{msg_id}: Error releasing lock lease in error handler: {release_err}")
                       lease_id = None # Prevent release in the final finally
                  # Now store the error
                  await store_result(error_result, item_id if item_id != "unknown" else "unknown_item", tenant_id if tenant_id != "unknown" else "unknown_tenant")
@@ -1550,11 +1594,15 @@ async def main(msg: func.QueueMessage) -> None:
              logging.error(f"{msg_id}: Cannot store system error due to missing info or Blob Client after toplevel error.")
 
     finally:
-         # Final cleanup: Ensure lease is released if something went wrong *before* the main processing finally block
-         # This is a double-check, the primary release should happen in the inner finally block.
+         # Final cleanup & telemetry
          if lease_id and lock_blob_name and blob_service_client:
               logging.warning(f"{msg_id}: Releasing lock in final top-level finally block (indicates potential prior release failure or error before inner finally).")
-              await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+              try:
+                  await release_blob_lease(blob_service_client, LOCK_CONTAINER_NAME, lock_blob_name, lease_id)
+                  logging.debug(f"{msg_id}: Successfully released lock lease '{lease_id}' in final cleanup")
+              except Exception as final_release_err:
+                  logging.error(f"{msg_id}: Error releasing lock lease in final cleanup: {final_release_err}")
+              lease_id = None
 
          end_time = pendulum.now('UTC')
          total_duration = (end_time - function_start_time).total_seconds()
