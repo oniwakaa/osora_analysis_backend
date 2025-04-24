@@ -1,0 +1,65 @@
+# Python Virtual Environments
+osora_az/
+.venv
+.venv/
+env/
+ENV/
+\.venv
+
+
+# Python Cache Files
+__pycache__/
+__pycache__
+**/__pycache__/
+**/__pycache__
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.in
+*.ini
+.ini
+config/ 
+
+# Azure Functions Local Settings (Contains Secrets)
+local.settings.json
+__blobstorage__/
+__blobstorage__
+
+# VS Code specific settings/history
+.vscode/
+.vscode
+.cursor/
+.cursor
+.history/
+
+
+# Test Artifacts (if tests are not needed in deployment)
+.pytest_cache/
+# tests/  # Uncomment this line if you don't want to deploy your 'tests' directory
+
+# Operating System Files (Example for macOS)
+.DS_Store
+
+# IDE/Tool specific files (add others as needed)
+.idea/
+
+# Secrets/Configuration Files (if using .env files)
+.env
+
+# Build/Distribution Artifacts
+dist/
+build/
+*.egg-info/
+
+# Deployment Packages
+*.zip
+
+# Optional: Python packages folder if forcing local build
+# Comment out if using remote build (default for Linux)
+# .python_packages/
+
+# Optional: Azurite local storage files (if using Azurite locally)
+__azurite*.json
+ai_con.sh
+osora_az

@@ -1,0 +1,24 @@
+{
+    "IsEncrypted": false,
+    "Values": {
+        "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+        "FUNCTIONS_WORKER_RUNTIME": "python",
+        "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+        "FUNCTIONS_WORKER_PROCESS_COUNT": "1",
+        "PYTHON_ISOLATE_WORKER_DEPENDENCIES": "1",
+        "AzureWebJobsSecretStorageType": "files",
+        "AzureWebJobsDisableHomepage": "true",
+        "STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
+        "AZURE_LANGUAGE_ENDPOINT": "https://your-text-analytics-endpoint.cognitiveservices.azure.com/",
+        "AZURE_LANGUAGE_KEY": "your-text-analytics-key",
+        "POWER_AUTOMATE_WEBHOOK_URL": "your-power-automate-webhook-url",
+        "SYNAPSE_CONNECTION_STRING": "your-synapse-connection-string",
+        "PYTHON_VIRTUALENV_NAME": "osora_az"
+    },
+    "Host": {
+        "LocalHttpPort": 7071,
+        "CORS": "*",
+        "CORSCredentials": false
+    },
+    "ConnectionStrings": {}
+} 
