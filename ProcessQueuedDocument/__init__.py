@@ -17,6 +17,7 @@ import pendulum # For timezone-aware datetime handling
 # Removed Anthropic import
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
+from google.api_core import exceptions as google_api_exceptions
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobServiceClient
@@ -141,7 +142,7 @@ try:
             
             # Initialize prompt generation model
             try:
-                gemini_model = genai.GenerativeModel(GEMINI_PROMPT_MODEL)
+                gemini_model = genai.GenerativeModel(f"models/{GEMINI_PROMPT_MODEL}")
                 logging.info(f"Gemini prompt model initialized: {GEMINI_PROMPT_MODEL}")
             except Exception as prompt_model_err:
                 logging.error(f"Failed to initialize Gemini prompt model: {prompt_model_err}", exc_info=True)
@@ -149,7 +150,7 @@ try:
             
             # Initialize analysis model
             try:
-                gemini_analysis_model = genai.GenerativeModel(GEMINI_ANALYSIS_MODEL)
+                gemini_analysis_model = genai.GenerativeModel(f"models/{GEMINI_ANALYSIS_MODEL}")
                 logging.info(f"Gemini analysis model initialized: {GEMINI_ANALYSIS_MODEL}")
             except Exception as analysis_model_err:
                 logging.error(f"Failed to initialize Gemini analysis model: {analysis_model_err}", exc_info=True)
@@ -446,6 +447,8 @@ async def release_blob_lease(blob_service_client: BlobServiceClient, container_n
     
     try:
         lock_blob_client = blob_service_client.get_blob_client(container_name, blob_name)
+        logging.info(f"Lease Lock Debug: Type of lock_blob_client before break: {type(lock_blob_client)}")
+        logging.debug(f"Lease Lock Debug: Attributes of lock_blob_client: {dir(lock_blob_client)}")
         await lock_blob_client.break_lease(lease_id=lease_id)  # Changed from release_lease to break_lease with named parameter
         logging.info(f"Lease Lock: Successfully released lease '{lease_id}' on '{blob_name}'.")
         # Optional: Delete the lock blob after releasing the lease if desired
@@ -584,7 +587,7 @@ async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Di
     
     try:
         # Construct API URL to get tasks assigned to the specific user
-        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignments/any(a:a/assigneeId eq '{user_id}')&$expand=details"
+        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignedToUser eq '{user_id}'&$expand=details"
         
         logging.info(f"Planner Tasks: Querying Graph API for tasks assigned to user: {user_id}")
         
@@ -752,7 +755,7 @@ These are the current planner tasks assigned to the document author/owner. Use t
 
             Top-Level JSON Keys (MANDATORY STRUCTURE):
 
-            "descriptive_summary": 5–7 objective sentences describing the document’s purpose, content, and key points. Must remain neutral and not evaluative.
+            "descriptive_summary": 5–7 objective sentences describing the document's purpose, content, and key points. Must remain neutral and not evaluative.
 
             "technical_summary": 3–5 sentences critically evaluating the quality and effectiveness of the document, based on its type and intended function.
 
@@ -780,7 +783,7 @@ These are the current planner tasks assigned to the document author/owner. Use t
 
             If a document is part of a draft cycle, under review, or linked to a specific deadline or objective, this must directly influence the tone and content of the evaluation.
 
-            Scoring should reflect expectations based on the document’s stage, role, and use-case in the project.
+            Scoring should reflect expectations based on the document's stage, role, and use-case in the project.
 
             Enforcement of Strict Format Compliance:
 
@@ -950,7 +953,7 @@ DOCUMENT CONTENT:
                 "raw_response": analysis_text
             }
             
-    except genai.RateLimitError as rle:
+    except google_api_exceptions.ResourceExhausted as rle:
         error_msg = f"Gemini Analysis: Rate limit error: {str(rle)}"
         logging.error(error_msg)
         return {
