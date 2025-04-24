@@ -48,7 +48,7 @@ IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "1
 # Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
-GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro-latest")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
@@ -428,8 +428,8 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
         try:
             # Acquire the lease using the lease client
             lease = await lease_client.acquire(lease_duration=lease_duration)
-            logging.info(f"Lease Lock: Successfully acquired lease '{lease}' on '{blob_name}'.")
-            return lease # Return the lease ID
+            logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' on '{blob_name}'.")
+            return lease.id # Return the lease ID
         except AttributeError as attr_err:
             # Handle AttributeError in case the acquire method is not found
             logging.error(f"Lease Lock: AttributeError when acquiring lease: {attr_err}. This might be a SDK version issue.")

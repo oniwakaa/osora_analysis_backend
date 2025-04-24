@@ -199,30 +199,34 @@ async def process_delta_changes(
     next_page_url = None
     delta_link_to_save = None
     initial_sync = False
-    http_client = None  # Initialize outside try block to use in finally
     
     # Determine content source type (SharePoint or OneDrive)
     source_type = "Unknown"
     site_id = None
+    resource_site_id = None  # Preserve the original site ID from the resource path
+    
     if resource_path:
-        if resource_path.startswith("sites/"):
+        # Clean up the path by removing leading/trailing slashes
+        clean_path = resource_path.strip('/')
+        if clean_path.startswith("sites/"):
             source_type = "SharePoint"
             # Extract the SharePoint site ID from the resource path
             logging.info(f"Extracting site ID from SharePoint resource path: '{resource_path}'")
             identifiers = extract_identifiers_from_resource_path(resource_path)
             site_id = identifiers.get("id")
+            resource_site_id = site_id  # Store in separate variable to prevent overwrites
             if site_id:
                 logging.info(f"Successfully extracted site ID: '{site_id}' from resource path '{resource_path}'")
             else:
                 logging.warning(f"Failed to extract site ID from SharePoint resource path: '{resource_path}'")
-        elif resource_path.startswith("drives/"):
+        elif clean_path.startswith("drives/"):
             source_type = "OneDrive"
-        elif resource_path.startswith("users/"):
+        elif clean_path.startswith("users/"):
             source_type = "OneDrive for Business"
     
     logging.info(f"Starting delta changes processing for {source_type} source. Resource path: {resource_path}")
-    if site_id:
-        logging.info(f"Using site ID: {site_id} for SharePoint delta changes")
+    if resource_site_id:
+        logging.info(f"Using site ID: {resource_site_id} for SharePoint delta changes")
 
     try:
         container_client = blob_service_client.get_container_client(DELTA_TOKEN_CONTAINER)
@@ -257,327 +261,333 @@ async def process_delta_changes(
 
     # --- 2. Loop through Delta API pages ---
     try:
-        # Create HTTP client outside the loop to ensure proper lifecycle management
-        http_client = httpx.AsyncClient(timeout=60.0)
-        current_url = next_page_url
-        total_items_found = 0  # Track total items found across all pages before deduplication
+        # Create HTTP client using async with to ensure proper lifecycle management
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            current_url = next_page_url
+            total_items_found = 0  # Track total items found across all pages before deduplication
 
-        while True:
-            delta_data = None
-            current_page_items = []
-            # Get token using the passed credential object
-            access_token = await get_graph_token(credential) # Pass credential
-            if not access_token:
-                 logging.error("Failed to get Graph token. Cannot process delta.")
-                 break
-
-            headers = {"Authorization": f"Bearer {access_token}"}
-            request_url = ""
-
-            try:
-                if current_url:
-                    request_url = current_url
-                    logging.info(f"Following delta/next link: {request_url}")
-                elif initial_sync:
-                    logging.info(f"Constructing initial delta query URL manually for {source_type} content")
-                    
-                    # Use the dedicated function to construct the URL
-                    request_url = construct_delta_query_url(resource_path)
-                    
-                    if not request_url:
-                         logging.warning(f"Could not construct initial delta URL for {source_type}. Skipping delta query.")
-                         break
-                         
-                    logging.info(f"Constructed initial request URL: {request_url}")
-                    initial_sync = False
-                else:
-                     logging.error("Processing loop in invalid state (no current_url and not initial_sync).")
+            while True:
+                delta_data = None
+                current_page_items = []
+                # Get token using the passed credential object
+                access_token = await get_graph_token(credential) # Pass credential
+                if not access_token:
+                     logging.error("Failed to get Graph token. Cannot process delta.")
                      break
 
-                # Add prefer header to ensure we only get changes
-                headers["Prefer"] = "deltashowremovedasdeleted"
-                
-                # Make the HTTP GET request
-                logging.info(f"Making GET request to: {request_url}")
-                response = await http_client.get(request_url, headers=headers)
-                logging.info(f"Received response status: {response.status_code} from {request_url}")
-                response.raise_for_status()
-                delta_data = response.json()
+                headers = {"Authorization": f"Bearer {access_token}"}
+                request_url = ""
 
-                # --- Process items ---
-                current_page_items = delta_data.get('value', [])
-                logging.info(f"Processing {len(current_page_items)} items from {source_type} response.")
-                total_items_found += len(current_page_items)
-                
-                for item in current_page_items:
-                    if not isinstance(item, dict): 
-                        continue
+                try:
+                    if current_url:
+                        request_url = current_url
+                        logging.info(f"Following delta/next link: {request_url}")
+                    elif initial_sync:
+                        logging.info(f"Constructing initial delta query URL manually for {source_type} content")
                         
-                    item_id = item.get('id')
-                    item_name = item.get('name')
-                    
-                    # Skip if it doesn't have an ID
-                    if not item_id:
-                        logging.warning("Item missing ID. Skipping.")
-                        continue
+                        # Use the dedicated function to construct the URL
+                        request_url = construct_delta_query_url(resource_path)
                         
-                    # Check if item is deleted
-                    if item.get('deleted'):
-                        logging.info(f"{source_type} item deleted: ID='{item_id}'")
-                        continue
-                        
-                    # Skip folders, we only want files
-                    if item.get('folder'):
-                        logging.info(f"{source_type} folder change: Name='{item_name}', ID='{item_id}'")
-                        continue
-                        
-                    # Only process if it's a file and has actual content changes
-                    if item.get('file'):
-                        # Extract the drive ID - important for accessing the file later
-                        # For SharePoint files, driveId is usually in parentReference
-                        parent_ref = item.get('parentReference', {})
-                        item_drive_id = parent_ref.get('driveId')
-                        
-                        # Try to get driveId from various locations depending on the source
-                        if not item_drive_id and isinstance(item.get('remoteItem'), dict):
-                             # This is a shared or referenced item
-                             remote_parent_ref = item['remoteItem'].get('parentReference', {})
-                             item_drive_id = remote_parent_ref.get('driveId')
-                             # Log additional details for SharePoint items
-                             if source_type == "SharePoint" and remote_parent_ref:
-                                 site_id = remote_parent_ref.get('siteId')
-                                 if site_id:
-                                     logging.info(f"SharePoint remote item found. SiteId: {site_id}")
-                        
-                        # Fallback to driveId at the item level (common in some Graph responses)
-                        if not item_drive_id: 
-                            item_drive_id = item.get('driveId')
-                            
-                        # For SharePoint files specifically, try additional paths to find driveId
-                        if not item_drive_id and source_type == "SharePoint":
-                            # Try from SharePoint-specific fields
-                            sharepoint_ids = item.get('sharepointIds', {})
-                            if sharepoint_ids:
-                                logging.info(f"Found SharePoint IDs for item: {sharepoint_ids}")
-                                # SharePoint items might have list ID information we can log
-                                list_id = sharepoint_ids.get('listId')
-                                list_item_id = sharepoint_ids.get('listItemId')
-                                if list_id:
-                                    logging.info(f"SharePoint item belongs to list. ListId: {list_id}, ListItemId: {list_item_id}")
-                            
-                            # For SharePoint, we might have site details in the nested path
-                            if parent_ref and 'siteId' in parent_ref:
-                                site_id = parent_ref.get('siteId')
-                                logging.info(f"Found SharePoint site ID in parent reference: {site_id}")
-                                
-                                # If we have a site ID but no drive ID, try to log a warning
-                                # We might need to enhance the code in the future to fetch the drive ID from the site
-                                if site_id and not item_drive_id:
-                                    logging.warning(f"Found SharePoint site ID but no driveId for item: {item_id}")
-                        
-                        if not item_drive_id:
-                             logging.warning(f"{source_type} item missing driveId. Skipping. Item ID: {item_id}, Name: {item_name}")
-                             continue
+                        if not request_url:
+                             logging.warning(f"Could not construct initial delta URL for {source_type}. Skipping delta query.")
+                             break
                              
-                        # Check if file was actually modified (has content changes)
-                        last_modified = item.get('lastModifiedDateTime')
-                        created_date = item.get('createdDateTime')
-                        
-                        logging.info(f"Found {source_type} file change: Name='{item_name}', ID='{item_id}', DriveID='{item_drive_id}', LastModified='{last_modified}'")
-                        
-                        # Add source_type to processing data for downstream processing awareness
-                        processing_data = {
-                            "tenantId": tenant_id, 
-                            "driveId": item_drive_id, 
-                            "itemId": item_id, 
-                            "fileName": item_name,
-                            "lastModified": last_modified,
-                            "created": created_date,
-                            "sourceType": source_type,  # Adding the source type for context
-                            "resourcePath": resource_path  # Add resource_path for potential recovery
-                        }
-                        
-                        # Add siteId to the processing data if this is a SharePoint item
-                        if source_type == "SharePoint" and site_id:
-                            processing_data["siteId"] = site_id
-                            logging.info(f"Added SharePoint siteId '{site_id}' to item '{item_id}'")
-                        elif source_type == "SharePoint" and not site_id:
-                            # Log warning if this is a SharePoint item but we don't have a siteId
-                            logging.warning(f"SharePoint item '{item_id}' missing siteId for queueing")
-                            
-                            # Try to extract siteId from the resource path again as a fallback
-                            if resource_path and resource_path.startswith("sites/"):
-                                identifiers = extract_identifiers_from_resource_path(resource_path)
-                                fallback_site_id = identifiers.get("id")
-                                if fallback_site_id:
-                                    processing_data["siteId"] = fallback_site_id
-                                    logging.info(f"Recovered SharePoint siteId '{fallback_site_id}' from resource path for item '{item_id}'")
-                            
-                            # Try to get siteId from parent reference as another fallback
-                            parent_ref = item.get('parentReference', {})
-                            if parent_ref and 'siteId' in parent_ref:
-                                parent_site_id = parent_ref.get('siteId')
-                                if parent_site_id:
-                                    processing_data["siteId"] = parent_site_id
-                                    logging.info(f"Retrieved SharePoint siteId '{parent_site_id}' from parentReference for item '{item_id}'")
-                        
-                        # Log the full processing data before queueing to confirm siteId presence
-                        logging.info(f"Queueing item data: {json.dumps(processing_data)}")
-                        
-                        potential_items_to_queue.append(processing_data)
-
-                # --- Check for next/delta link ---
-                next_link = delta_data.get('@odata.nextLink')
-                delta_link = delta_data.get('@odata.deltaLink')
-
-                if next_link:
-                    logging.info(f"Following @odata.nextLink for {source_type} changes...")
-                    current_url = next_link
-                    delta_link_to_save = None
-                elif delta_link:
-                    logging.info(f"Found final @odata.deltaLink for {source_type} subscription.")
-                    delta_link_to_save = delta_link
-                    current_url = None
-                    break
-                else:
-                    logging.warning(f"No nextLink or deltaLink for {source_type}. Processing complete.")
-                    delta_link_to_save = None
-                    current_url = None
-                    if not next_page_url: # Check if we started fresh
-                         try:
-                              await blob_client.delete_blob(delete_snapshots="include")
-                              logging.info(f"Deleted token blob for {subscription_id} (initial sync yielded no delta link).")
-                         except ResourceNotFoundError: pass
-                         except Exception as del_err: logging.error(f"Error deleting token blob: {del_err}")
-                    break
-
-            except httpx.HTTPStatusError as http_err:
-                 logging.error(f"HTTP error processing {source_type} delta URL {http_err.request.url!r}: {http_err.response.status_code}", exc_info=False)
-                 error_payload = None
-                 try:
-                      error_payload = http_err.response.json()
-                      logging.error(f"Graph error details: {json.dumps(error_payload)}")
-                      graph_error_code = error_payload.get("error", {}).get("code")
-                      
-                      # Only reset the token if Graph explicitly says it's invalid
-                      if graph_error_code == 'SyncStateNotFound':
-                           logging.warning(f"Delta token invalid/expired (SyncStateNotFound) for {source_type}. Resetting.")
-                           current_url = None
-                           initial_sync = True
-                           delta_link_to_save = None
-                           try:
-                                await blob_client.delete_blob(delete_snapshots="include")
-                                logging.info(f"Deleted invalid delta token blob for {subscription_id}.")
-                           except ResourceNotFoundError: pass
-                           except Exception as del_err: logging.error(f"Error deleting invalid token: {del_err}")
-                           continue
-                      else:
-                           # For other errors, don't reset automatically
-                           logging.error(f"Graph API error for {source_type}: {graph_error_code}. Not resetting token.")
-                           break
-                 except json.JSONDecodeError: logging.error(f"Could not parse error response body: {http_err.response.text}")
-                 except Exception as parse_err: logging.error(f"Error processing error response: {parse_err}")
-                 break
-            except Exception as e:
-                 logging.error(f"Unexpected error in {source_type} delta processing loop: {e}", exc_info=True)
-                 break
-
-        # --- Deduplicate items ---
-        # Use a dictionary with itemId as key to efficiently track unique items
-        unique_items = {}
-        skipped_items = 0
-        duplicate_item_ids = set()
-        
-        for item in potential_items_to_queue:
-            item_id = item.get("itemId")
-            
-            # Skip any items with missing itemId
-            if not item_id:
-                logging.warning(f"Skipping {item.get('sourceType', 'unknown')} item with missing itemId")
-                skipped_items += 1
-                continue
-                
-            if item_id in unique_items:
-                # Track duplicates for logging
-                duplicate_item_ids.add(item_id)
-                source = item.get('sourceType', 'unknown')
-                logging.info(f"Detected duplicate {source} item: ID='{item_id}', Name='{item.get('fileName', 'unknown')}'")
-                
-                # If we have a duplicate, keep the more recent version based on lastModified
-                # For SharePoint items, also prioritize items with siteId
-                if (source == "SharePoint" and "siteId" in item and "siteId" not in unique_items[item_id]):
-                    logging.info(f"  Replacing with version containing siteId: ID='{item_id}'")
-                    unique_items[item_id] = item
-                elif item.get("lastModified") and unique_items[item_id].get("lastModified"):
-                    if item["lastModified"] > unique_items[item_id]["lastModified"]:
-                        logging.info(f"  Replacing with more recent version of: ID='{item_id}'")
-                        unique_items[item_id] = item
-            else:
-                unique_items[item_id] = item
-        
-        # Convert dictionary values back to a list
-        all_processed_items = list(unique_items.values())
-        
-        # Log detailed deduplication results
-        logging.info(f"Deduplication summary for {source_type} subscription {subscription_id}:")
-        logging.info(f"  - Total items found: {total_items_found}")
-        logging.info(f"  - Items with missing ID skipped: {skipped_items}")
-        logging.info(f"  - Duplicate items removed: {len(duplicate_item_ids)} (unique duplicate IDs: {len(duplicate_item_ids)})")
-        logging.info(f"  - Unique items after deduplication: {len(all_processed_items)}")
-        
-        if len(all_processed_items) > 0:
-            logging.info(f"{source_type} items being queued for processing from subscription {subscription_id}:")
-            sharepoint_with_site_id = 0
-            sharepoint_without_site_id = 0
-            
-            for idx, item in enumerate(all_processed_items):
-                source = item.get('sourceType', source_type)
-                item_id = item.get('itemId', 'unknown')
-                item_name = item.get('fileName', 'unknown')
-                
-                # Build a detailed log message
-                log_msg = f"  {idx+1}. {source} Item: ID='{item_id}', Name='{item_name}'"
-                
-                # Count and log items with/without site IDs
-                if source == "SharePoint":
-                    if "siteId" in item:
-                        site_id = item.get("siteId")
-                        log_msg += f", SiteId='{site_id}'"
-                        sharepoint_with_site_id += 1
+                        logging.info(f"Constructed initial request URL: {request_url}")
+                        initial_sync = False
                     else:
-                        log_msg += ", SiteId=MISSING"
-                        sharepoint_without_site_id += 1
-                
-                logging.info(log_msg)
-            
-            # Log summary of SharePoint items with site IDs
-            if sharepoint_with_site_id > 0 or sharepoint_without_site_id > 0:
-                logging.info(f"SharePoint items summary: {sharepoint_with_site_id} with site ID, {sharepoint_without_site_id} missing site ID")
-        
-        # --- Persist the final delta link ---
-        if delta_link_to_save:
-            try:
-                await blob_client.upload_blob(delta_link_to_save.encode('utf-8'), overwrite=True)
-                logging.info(f"Stored final @odata.deltaLink for {source_type} subscription {subscription_id}.")
-            except Exception as e:
-                logging.error(f"Error storing final deltaLink for {source_type}: {e}", exc_info=True)
-        elif not next_page_url and not all_processed_items and not current_url:
-             logging.info(f"Initial {source_type} delta query returned no changes/link for {subscription_id}.")
+                         logging.error("Processing loop in invalid state (no current_url and not initial_sync).")
+                         break
 
-        logging.info(f"Finished {source_type} delta processing for {subscription_id}. Found {len(all_processed_items)} unique items.")
-        return all_processed_items
+                    # Add prefer header to ensure we only get changes
+                    headers["Prefer"] = "deltashowremovedasdeleted"
+                    
+                    # Make the HTTP GET request
+                    logging.info(f"Making GET request to: {request_url}")
+                    response = await http_client.get(request_url, headers=headers)
+                    logging.info(f"Received response status: {response.status_code} from {request_url}")
+                    response.raise_for_status()
+                    delta_data = response.json()
+
+                    # --- Process items ---
+                    current_page_items = delta_data.get('value', [])
+                    logging.info(f"Processing {len(current_page_items)} items from {source_type} response.")
+                    total_items_found += len(current_page_items)
+                    
+                    for item in current_page_items:
+                        if not isinstance(item, dict): 
+                            continue
+                            
+                        item_id = item.get('id')
+                        item_name = item.get('name')
+                        
+                        # Skip if it doesn't have an ID
+                        if not item_id:
+                            logging.warning("Item missing ID. Skipping.")
+                            continue
+                            
+                        # Check if item is deleted
+                        if item.get('deleted'):
+                            logging.info(f"{source_type} item deleted: ID='{item_id}'")
+                            continue
+                            
+                        # Skip folders, we only want files
+                        if item.get('folder'):
+                            logging.info(f"{source_type} folder change: Name='{item_name}', ID='{item_id}'")
+                            continue
+                            
+                        # Only process if it's a file and has actual content changes
+                        if item.get('file'):
+                            # Extract the drive ID - important for accessing the file later
+                            # For SharePoint files, driveId is usually in parentReference
+                            parent_ref = item.get('parentReference', {})
+                            item_drive_id = parent_ref.get('driveId')
+                            
+                            # Try to get driveId from various locations depending on the source
+                            if not item_drive_id and isinstance(item.get('remoteItem'), dict):
+                                 # This is a shared or referenced item
+                                 remote_parent_ref = item['remoteItem'].get('parentReference', {})
+                                 item_drive_id = remote_parent_ref.get('driveId')
+                                 # Log additional details for SharePoint items
+                                 if source_type == "SharePoint" and remote_parent_ref:
+                                     site_id = remote_parent_ref.get('siteId')
+                                     if site_id:
+                                         logging.info(f"SharePoint remote item found. SiteId: {site_id}")
+                            
+                            # Fallback to driveId at the item level (common in some Graph responses)
+                            if not item_drive_id: 
+                                item_drive_id = item.get('driveId')
+                                
+                            # For SharePoint files specifically, try additional paths to find driveId
+                            if not item_drive_id and source_type == "SharePoint":
+                                # Try from SharePoint-specific fields
+                                sharepoint_ids = item.get('sharepointIds', {})
+                                if sharepoint_ids:
+                                    logging.info(f"Found SharePoint IDs for item: {sharepoint_ids}")
+                                    # SharePoint items might have list ID information we can log
+                                    list_id = sharepoint_ids.get('listId')
+                                    list_item_id = sharepoint_ids.get('listItemId')
+                                    if list_id:
+                                        logging.info(f"SharePoint item belongs to list. ListId: {list_id}, ListItemId: {list_item_id}")
+                                
+                                # For SharePoint, we might have site details in the nested path
+                                if parent_ref and 'siteId' in parent_ref:
+                                    site_id = parent_ref.get('siteId')
+                                    logging.info(f"Found SharePoint site ID in parent reference: {site_id}")
+                                    
+                                    # If we have a site ID but no drive ID, try to log a warning
+                                    # We might need to enhance the code in the future to fetch the drive ID from the site
+                                    if site_id and not item_drive_id:
+                                        logging.warning(f"Found SharePoint site ID but no driveId for item: {item_id}")
+                            
+                            if not item_drive_id:
+                                 logging.warning(f"{source_type} item missing driveId. Skipping. Item ID: {item_id}, Name: {item_name}")
+                                 continue
+                                 
+                            # Check if file was actually modified (has content changes)
+                            last_modified = item.get('lastModifiedDateTime')
+                            created_date = item.get('createdDateTime')
+                            
+                            logging.info(f"Found {source_type} file change: Name='{item_name}', ID='{item_id}', DriveID='{item_drive_id}', LastModified='{last_modified}'")
+                            
+                            # Add source_type to processing data for downstream processing awareness
+                            processing_data = {
+                                "tenantId": tenant_id, 
+                                "driveId": item_drive_id, 
+                                "itemId": item_id, 
+                                "fileName": item_name,
+                                "lastModified": last_modified,
+                                "created": created_date,
+                                "sourceType": source_type,  # Adding the source type for context
+                                "resourcePath": resource_path  # Add resource_path for potential recovery
+                            }
+                            
+                            # Add siteId to the processing data if this is a SharePoint item
+                            if source_type == "SharePoint":
+                                item_site_id = None
+                                
+                                # First try to use the resource path's site ID as primary source
+                                if resource_site_id:
+                                    item_site_id = resource_site_id
+                                    processing_data["siteId"] = resource_site_id
+                                    logging.info(f"Added SharePoint siteId '{resource_site_id}' from resource path to item '{item_id}'")
+                                # Then consider site ID from item metadata (if available)
+                                elif site_id:
+                                    item_site_id = site_id
+                                    processing_data["siteId"] = site_id
+                                    logging.info(f"Added SharePoint siteId '{site_id}' from item metadata to item '{item_id}'")
+                                
+                                # If we still don't have a site ID, try fallback methods
+                                if not item_site_id:
+                                    # Log warning if this is a SharePoint item but we don't have a siteId
+                                    logging.warning(f"SharePoint item '{item_id}' missing siteId for queueing")
+                                    
+                                    # Try to extract siteId from the resource path again as a fallback
+                                    if resource_path:
+                                        clean_path = resource_path.strip('/')
+                                        if clean_path.startswith("sites/"):
+                                            identifiers = extract_identifiers_from_resource_path(resource_path)
+                                            fallback_site_id = identifiers.get("id")
+                                            if fallback_site_id:
+                                                processing_data["siteId"] = fallback_site_id
+                                                logging.info(f"Recovered SharePoint siteId '{fallback_site_id}' from resource path for item '{item_id}'")
+                                    
+                                    # Try to get siteId from parent reference as another fallback
+                                    parent_ref = item.get('parentReference', {})
+                                    if parent_ref and 'siteId' in parent_ref:
+                                        parent_site_id = parent_ref.get('siteId')
+                                        if parent_site_id:
+                                            processing_data["siteId"] = parent_site_id
+                                            logging.info(f"Retrieved SharePoint siteId '{parent_site_id}' from parentReference for item '{item_id}'")
+                            
+                            # Log the full processing data before queueing to confirm siteId presence
+                            logging.info(f"Queueing item data: {json.dumps(processing_data)}")
+                            
+                            potential_items_to_queue.append(processing_data)
+
+                    # --- Check for next/delta link ---
+                    next_link = delta_data.get('@odata.nextLink')
+                    delta_link = delta_data.get('@odata.deltaLink')
+
+                    if next_link:
+                        logging.info(f"Following @odata.nextLink for {source_type} changes...")
+                        current_url = next_link
+                        delta_link_to_save = None
+                    elif delta_link:
+                        logging.info(f"Found final @odata.deltaLink for {source_type} subscription.")
+                        delta_link_to_save = delta_link
+                        current_url = None
+                        break
+                    else:
+                        logging.warning(f"No nextLink or deltaLink for {source_type}. Processing complete.")
+                        delta_link_to_save = None
+                        current_url = None
+                        if not next_page_url: # Check if we started fresh
+                             try:
+                                  await blob_client.delete_blob(delete_snapshots="include")
+                                  logging.info(f"Deleted token blob for {subscription_id} (initial sync yielded no delta link).")
+                             except ResourceNotFoundError: pass
+                             except Exception as del_err: logging.error(f"Error deleting token blob: {del_err}")
+                        break
+
+                except httpx.HTTPStatusError as http_err:
+                     logging.error(f"HTTP error processing {source_type} delta URL {http_err.request.url!r}: {http_err.response.status_code}", exc_info=False)
+                     error_payload = None
+                     try:
+                          error_payload = http_err.response.json()
+                          logging.error(f"Graph error details: {json.dumps(error_payload)}")
+                          graph_error_code = error_payload.get("error", {}).get("code")
+                          
+                          # Only reset the token if Graph explicitly says it's invalid
+                          if graph_error_code == 'SyncStateNotFound':
+                               logging.warning(f"Delta token invalid/expired (SyncStateNotFound) for {source_type}. Resetting.")
+                               current_url = None
+                               initial_sync = True
+                               delta_link_to_save = None
+                               try:
+                                    await blob_client.delete_blob(delete_snapshots="include")
+                                    logging.info(f"Deleted invalid delta token blob for {subscription_id}.")
+                               except ResourceNotFoundError: pass
+                               except Exception as del_err: logging.error(f"Error deleting invalid token: {del_err}")
+                               continue
+                          else:
+                               # For other errors, don't reset automatically
+                               logging.error(f"Graph API error for {source_type}: {graph_error_code}. Not resetting token.")
+                               break
+                     except json.JSONDecodeError: logging.error(f"Could not parse error response body: {http_err.response.text}")
+                     except Exception as parse_err: logging.error(f"Error processing error response: {parse_err}")
+                     break
+                except Exception as e:
+                     logging.error(f"Unexpected error in {source_type} delta processing loop: {e}", exc_info=True)
+                     break
+
+            # --- Deduplicate items ---
+            # Use a dictionary with itemId as key to efficiently track unique items
+            unique_items = {}
+            skipped_items = 0
+            duplicate_item_ids = set()
+            
+            for item in potential_items_to_queue:
+                item_id = item.get("itemId")
+                
+                # Skip any items with missing itemId
+                if not item_id:
+                    logging.warning(f"Skipping {item.get('sourceType', 'unknown')} item with missing itemId")
+                    skipped_items += 1
+                    continue
+                    
+                if item_id in unique_items:
+                    # Track duplicates for logging
+                    duplicate_item_ids.add(item_id)
+                    source = item.get('sourceType', 'unknown')
+                    logging.info(f"Detected duplicate {source} item: ID='{item_id}', Name='{item.get('fileName', 'unknown')}'")
+                    
+                    # If we have a duplicate, keep the more recent version based on lastModified
+                    # For SharePoint items, also prioritize items with siteId
+                    if (source == "SharePoint" and "siteId" in item and "siteId" not in unique_items[item_id]):
+                        logging.info(f"  Replacing with version containing siteId: ID='{item_id}'")
+                        unique_items[item_id] = item
+                    elif item.get("lastModified") and unique_items[item_id].get("lastModified"):
+                        if item["lastModified"] > unique_items[item_id]["lastModified"]:
+                            logging.info(f"  Replacing with more recent version of: ID='{item_id}'")
+                            unique_items[item_id] = item
+                else:
+                    unique_items[item_id] = item
+            
+            # Convert dictionary values back to a list
+            all_processed_items = list(unique_items.values())
+            
+            # Log detailed deduplication results
+            logging.info(f"Deduplication summary for {source_type} subscription {subscription_id}:")
+            logging.info(f"  - Total items found: {total_items_found}")
+            logging.info(f"  - Items with missing ID skipped: {skipped_items}")
+            logging.info(f"  - Duplicate items removed: {len(duplicate_item_ids)} (unique duplicate IDs: {len(duplicate_item_ids)})")
+            logging.info(f"  - Unique items after deduplication: {len(all_processed_items)}")
+            
+            if len(all_processed_items) > 0:
+                logging.info(f"{source_type} items being queued for processing from subscription {subscription_id}:")
+                sharepoint_with_site_id = 0
+                sharepoint_without_site_id = 0
+                
+                for idx, item in enumerate(all_processed_items):
+                    source = item.get('sourceType', source_type)
+                    item_id = item.get('itemId', 'unknown')
+                    item_name = item.get('fileName', 'unknown')
+                    
+                    # Build a detailed log message
+                    log_msg = f"  {idx+1}. {source} Item: ID='{item_id}', Name='{item_name}'"
+                    
+                    # Count and log items with/without site IDs
+                    if source == "SharePoint":
+                        if "siteId" in item:
+                            site_id = item.get("siteId")
+                            log_msg += f", SiteId='{site_id}'"
+                            sharepoint_with_site_id += 1
+                        else:
+                            log_msg += ", SiteId=MISSING"
+                            sharepoint_without_site_id += 1
+                    
+                    logging.info(log_msg)
+                
+                # Log summary of SharePoint items with site IDs
+                if sharepoint_with_site_id > 0 or sharepoint_without_site_id > 0:
+                    logging.info(f"SharePoint items summary: {sharepoint_with_site_id} with site ID, {sharepoint_without_site_id} missing site ID")
+            
+            # --- Persist the final delta link ---
+            if delta_link_to_save:
+                try:
+                    await blob_client.upload_blob(delta_link_to_save.encode('utf-8'), overwrite=True)
+                    logging.info(f"Stored final @odata.deltaLink for {source_type} subscription {subscription_id}.")
+                except Exception as e:
+                    logging.error(f"Error storing final deltaLink for {source_type}: {e}", exc_info=True)
+            elif not next_page_url and not all_processed_items and not current_url:
+                 logging.info(f"Initial {source_type} delta query returned no changes/link for {subscription_id}.")
+
+            logging.info(f"Finished {source_type} delta processing for {subscription_id}. Found {len(all_processed_items)} unique items.")
+            return all_processed_items
     
     except Exception as e:
         logging.error(f"Unexpected error in process_delta_changes for {source_type}: {e}", exc_info=True)
         return []
-    finally:
-        # Ensure httpx client is properly closed in all execution paths
-        if http_client:
-            try:
-                await http_client.aclose()
-                logging.info(f"HTTP client for {source_type} processing closed successfully")
-            except Exception as close_err:
-                logging.error(f"Error closing HTTP client for {source_type}: {close_err}", exc_info=True)
 
 
 async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
@@ -642,7 +652,9 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                 source_type = "Unknown"
                 site_id = None
                 
-                if resource_path.startswith("sites/"):
+                # Clean up the path by removing leading/trailing slashes
+                clean_path = resource_path.strip('/')
+                if clean_path.startswith("sites/"):
                     source_type = "SharePoint"
                     # Extract the SharePoint site ID using our helper function
                     logging.info(f"Main: Extracting SharePoint site ID from notification resource path: '{resource_path}'")
@@ -653,10 +665,10 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                     else:
                         logging.warning(f"Main: Failed to extract SharePoint site ID from resource path: '{resource_path}'")
                     sharepoint_count += 1
-                elif resource_path.startswith("drives/"):
+                elif clean_path.startswith("drives/"):
                     source_type = "OneDrive"
                     onedrive_count += 1
-                elif resource_path.startswith("users/"):
+                elif clean_path.startswith("users/"):
                     source_type = "OneDrive for Business"
                     onedrive_count += 1
                 else:
@@ -766,16 +778,18 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                                     # One last attempt to get siteId from the path if missing
                                     if "resourcePath" in item:
                                         resource_path = item.get("resourcePath")
-                                        if resource_path and resource_path.startswith("sites/"):
-                                            identifiers = extract_identifiers_from_resource_path(resource_path)
-                                            recovered_site_id = identifiers.get("id")
-                                            if recovered_site_id:
-                                                item["siteId"] = recovered_site_id
-                                                log_msg += f" -> RECOVERED from path: '{recovered_site_id}'"
-                                                # Update the JSON message with the recovered site ID
-                                                messages_to_send[idx] = json.dumps(item)
-                                                sharepoint_items_with_site_id += 1
-                                                sharepoint_items_missing_site_id -= 1
+                                        if resource_path:
+                                            clean_path = resource_path.strip('/')
+                                            if clean_path.startswith("sites/"):
+                                                identifiers = extract_identifiers_from_resource_path(resource_path)
+                                                recovered_site_id = identifiers.get("id")
+                                                if recovered_site_id:
+                                                    item["siteId"] = recovered_site_id
+                                                    log_msg += f" -> RECOVERED from path: '{recovered_site_id}'"
+                                                    # Update the JSON message with the recovered site ID
+                                                    messages_to_send[idx] = json.dumps(item)
+                                                    sharepoint_items_with_site_id += 1
+                                                    sharepoint_items_missing_site_id -= 1
                                 
                             logging.info(log_msg)
                         except Exception as parse_err:
