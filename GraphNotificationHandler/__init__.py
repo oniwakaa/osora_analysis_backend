@@ -78,6 +78,7 @@ def extract_identifiers_from_resource_path(resource_path: str) -> Dict[str, str]
     result = {"path_type": None, "id": None}
     
     if not resource_path:
+        logging.warning("Empty resource path provided to extract_identifiers_from_resource_path")
         return result
         
     # Clean up the path by removing leading/trailing slashes
@@ -85,21 +86,30 @@ def extract_identifiers_from_resource_path(resource_path: str) -> Dict[str, str]
     parts = clean_path.split('/')
     
     if not parts:
+        logging.warning(f"No parts found in resource path: '{resource_path}'")
         return result
     
     # Determine path type and extract the relevant ID
     if clean_path.startswith("me/"):
         result["path_type"] = "me"
+        logging.info(f"Resource path '{resource_path}' identified as 'me' path type")
     elif clean_path.startswith("users/"):
         result["path_type"] = "users"
         if len(parts) > 1:
             result["id"] = parts[1]
+            logging.info(f"Extracted user ID: '{result['id']}' from path: '{resource_path}'")
+        else:
+            logging.warning(f"Could not extract user ID from path: '{resource_path}'")
     elif clean_path.startswith("drives/"):
         result["path_type"] = "drives"
         if len(parts) > 1:
             result["id"] = parts[1]
+            logging.info(f"Extracted drive ID: '{result['id']}' from path: '{resource_path}'")
+        else:
+            logging.warning(f"Could not extract drive ID from path: '{resource_path}'")
     elif clean_path.startswith("sites/"):
         result["path_type"] = "sites"
+        logging.info(f"Processing SharePoint site path: '{resource_path}' with {len(parts)} parts")
         # SharePoint site paths can be complex, handle multiple formats:
         # - sites/root: Root site
         # - sites/{hostname},{siteid}: Standard site format
@@ -115,9 +125,14 @@ def extract_identifiers_from_resource_path(resource_path: str) -> Dict[str, str]
                 # This might be a nested site collection path
                 # Grab the remaining parts to form a complete site path
                 site_identifier = "/".join(parts[1:])
+                logging.info(f"Using multiple path segments for site ID: '{site_identifier}'")
             
             result["id"] = site_identifier
             logging.info(f"Extracted SharePoint site identifier: '{site_identifier}' from path: '{resource_path}'")
+        else:
+            logging.warning(f"Could not extract site identifier from SharePoint path: '{resource_path}'")
+    else:
+        logging.warning(f"Unknown resource path format: '{resource_path}'")
     
     return result
 
@@ -193,8 +208,13 @@ async def process_delta_changes(
         if resource_path.startswith("sites/"):
             source_type = "SharePoint"
             # Extract the SharePoint site ID from the resource path
+            logging.info(f"Extracting site ID from SharePoint resource path: '{resource_path}'")
             identifiers = extract_identifiers_from_resource_path(resource_path)
             site_id = identifiers.get("id")
+            if site_id:
+                logging.info(f"Successfully extracted site ID: '{site_id}' from resource path '{resource_path}'")
+            else:
+                logging.warning(f"Failed to extract site ID from SharePoint resource path: '{resource_path}'")
         elif resource_path.startswith("drives/"):
             source_type = "OneDrive"
         elif resource_path.startswith("users/"):
@@ -373,13 +393,36 @@ async def process_delta_changes(
                             "fileName": item_name,
                             "lastModified": last_modified,
                             "created": created_date,
-                            "sourceType": source_type  # Adding the source type for context
+                            "sourceType": source_type,  # Adding the source type for context
+                            "resourcePath": resource_path  # Add resource_path for potential recovery
                         }
                         
                         # Add siteId to the processing data if this is a SharePoint item
                         if source_type == "SharePoint" and site_id:
                             processing_data["siteId"] = site_id
                             logging.info(f"Added SharePoint siteId '{site_id}' to item '{item_id}'")
+                        elif source_type == "SharePoint" and not site_id:
+                            # Log warning if this is a SharePoint item but we don't have a siteId
+                            logging.warning(f"SharePoint item '{item_id}' missing siteId for queueing")
+                            
+                            # Try to extract siteId from the resource path again as a fallback
+                            if resource_path and resource_path.startswith("sites/"):
+                                identifiers = extract_identifiers_from_resource_path(resource_path)
+                                fallback_site_id = identifiers.get("id")
+                                if fallback_site_id:
+                                    processing_data["siteId"] = fallback_site_id
+                                    logging.info(f"Recovered SharePoint siteId '{fallback_site_id}' from resource path for item '{item_id}'")
+                            
+                            # Try to get siteId from parent reference as another fallback
+                            parent_ref = item.get('parentReference', {})
+                            if parent_ref and 'siteId' in parent_ref:
+                                parent_site_id = parent_ref.get('siteId')
+                                if parent_site_id:
+                                    processing_data["siteId"] = parent_site_id
+                                    logging.info(f"Retrieved SharePoint siteId '{parent_site_id}' from parentReference for item '{item_id}'")
+                        
+                        # Log the full processing data before queueing to confirm siteId presence
+                        logging.info(f"Queueing item data: {json.dumps(processing_data)}")
                         
                         potential_items_to_queue.append(processing_data)
 
@@ -461,7 +504,11 @@ async def process_delta_changes(
                 logging.info(f"Detected duplicate {source} item: ID='{item_id}', Name='{item.get('fileName', 'unknown')}'")
                 
                 # If we have a duplicate, keep the more recent version based on lastModified
-                if item.get("lastModified") and unique_items[item_id].get("lastModified"):
+                # For SharePoint items, also prioritize items with siteId
+                if (source == "SharePoint" and "siteId" in item and "siteId" not in unique_items[item_id]):
+                    logging.info(f"  Replacing with version containing siteId: ID='{item_id}'")
+                    unique_items[item_id] = item
+                elif item.get("lastModified") and unique_items[item_id].get("lastModified"):
                     if item["lastModified"] > unique_items[item_id]["lastModified"]:
                         logging.info(f"  Replacing with more recent version of: ID='{item_id}'")
                         unique_items[item_id] = item
@@ -480,9 +527,32 @@ async def process_delta_changes(
         
         if len(all_processed_items) > 0:
             logging.info(f"{source_type} items being queued for processing from subscription {subscription_id}:")
+            sharepoint_with_site_id = 0
+            sharepoint_without_site_id = 0
+            
             for idx, item in enumerate(all_processed_items):
                 source = item.get('sourceType', source_type)
-                logging.info(f"  {idx+1}. {source} Item: ID='{item.get('itemId', 'unknown')}', Name='{item.get('fileName', 'unknown')}'")
+                item_id = item.get('itemId', 'unknown')
+                item_name = item.get('fileName', 'unknown')
+                
+                # Build a detailed log message
+                log_msg = f"  {idx+1}. {source} Item: ID='{item_id}', Name='{item_name}'"
+                
+                # Count and log items with/without site IDs
+                if source == "SharePoint":
+                    if "siteId" in item:
+                        site_id = item.get("siteId")
+                        log_msg += f", SiteId='{site_id}'"
+                        sharepoint_with_site_id += 1
+                    else:
+                        log_msg += ", SiteId=MISSING"
+                        sharepoint_without_site_id += 1
+                
+                logging.info(log_msg)
+            
+            # Log summary of SharePoint items with site IDs
+            if sharepoint_with_site_id > 0 or sharepoint_without_site_id > 0:
+                logging.info(f"SharePoint items summary: {sharepoint_with_site_id} with site ID, {sharepoint_without_site_id} missing site ID")
         
         # --- Persist the final delta link ---
         if delta_link_to_save:
@@ -575,10 +645,13 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                 if resource_path.startswith("sites/"):
                     source_type = "SharePoint"
                     # Extract the SharePoint site ID using our helper function
+                    logging.info(f"Main: Extracting SharePoint site ID from notification resource path: '{resource_path}'")
                     identifiers = extract_identifiers_from_resource_path(resource_path)
                     site_id = identifiers.get("id")
                     if site_id:
-                        logging.info(f"Extracted SharePoint site ID from notification: {site_id}")
+                        logging.info(f"Main: Successfully extracted SharePoint site ID: '{site_id}' from notification")
+                    else:
+                        logging.warning(f"Main: Failed to extract SharePoint site ID from resource path: '{resource_path}'")
                     sharepoint_count += 1
                 elif resource_path.startswith("drives/"):
                     source_type = "OneDrive"
@@ -668,20 +741,49 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                     
                     # Add specific details about what's being queued
                     logging.info(f"Queueing {len(messages_to_send)} items for processing...")
+                    sharepoint_items_with_site_id = 0
+                    sharepoint_items_missing_site_id = 0
+                    
                     for idx, item_json in enumerate(messages_to_send):
                         try:
                             item = json.loads(item_json)
                             source = item.get("sourceType", "Unknown")
-                            log_msg = f"  {idx+1}. Queuing {source} item: ID='{item.get('itemId', 'unknown')}', Name='{item.get('fileName', 'unknown')}', Tenant='{item.get('tenantId', 'unknown')}'"
+                            item_id = item.get('itemId', 'unknown')
+                            item_name = item.get('fileName', 'unknown')
+                            tenant_id = item.get('tenantId', 'unknown')
+                            
+                            log_msg = f"  {idx+1}. Queuing {source} item: ID='{item_id}', Name='{item_name}', Tenant='{tenant_id}'"
                             
                             # Add site ID information to the log message if available
-                            if source == "SharePoint" and "siteId" in item:
-                                site_id = item.get("siteId")
-                                log_msg += f", SiteID='{site_id}'"
+                            if source == "SharePoint":
+                                if "siteId" in item:
+                                    site_id = item.get("siteId")
+                                    log_msg += f", SiteID='{site_id}'"
+                                    sharepoint_items_with_site_id += 1
+                                else:
+                                    log_msg += ", SiteID=MISSING"
+                                    sharepoint_items_missing_site_id += 1
+                                    # One last attempt to get siteId from the path if missing
+                                    if "resourcePath" in item:
+                                        resource_path = item.get("resourcePath")
+                                        if resource_path and resource_path.startswith("sites/"):
+                                            identifiers = extract_identifiers_from_resource_path(resource_path)
+                                            recovered_site_id = identifiers.get("id")
+                                            if recovered_site_id:
+                                                item["siteId"] = recovered_site_id
+                                                log_msg += f" -> RECOVERED from path: '{recovered_site_id}'"
+                                                # Update the JSON message with the recovered site ID
+                                                messages_to_send[idx] = json.dumps(item)
+                                                sharepoint_items_with_site_id += 1
+                                                sharepoint_items_missing_site_id -= 1
                                 
                             logging.info(log_msg)
-                        except Exception:
-                            logging.warning(f"  {idx+1}. Could not parse queued item JSON for logging")
+                        except Exception as parse_err:
+                            logging.warning(f"  {idx+1}. Could not parse queued item JSON for logging: {parse_err}")
+                    
+                    # Log summary of SharePoint items with site IDs
+                    if sharepoint_items_with_site_id > 0 or sharepoint_items_missing_site_id > 0:
+                        logging.info(f"Final Queue Summary: SharePoint items - {sharepoint_items_with_site_id} with site ID, {sharepoint_items_missing_site_id} missing site ID")
                             
                     # Send to queue
                     msg.set(messages_to_send)

@@ -47,8 +47,8 @@ MAX_CHARS_FOR_ANALYSIS = int(os.environ.get("MAX_CHARS_FOR_ANALYSIS", "150000"))
 IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "10"))
 # Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash")
-GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro")
+GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-flash-latest")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
@@ -1012,7 +1012,7 @@ DOCUMENT CONTENT:
             "status": "gemini_rate_limit_error",
             "error": error_msg
         }
-    except genai.APIError as api_err:
+    except google_api_exceptions.GoogleAPIError as api_err:
         error_msg = f"Gemini Analysis: API error: {str(api_err)}"
         logging.error(error_msg)
         return {
