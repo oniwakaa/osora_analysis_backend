@@ -1,5 +1,5 @@
 # --- Start of ProcessQueuedDocument/__init__.py ---
-# --- Version: Azure Document Intelligence Integration (Simplified - No Tavily/Search Context) ---
+# --- Version: Azure Document Intelligence Integration (Gemini Analysis) ---
 
 import logging
 import json
@@ -14,9 +14,9 @@ import urllib.parse
 import azure.functions as func
 import httpx
 import pendulum # For timezone-aware datetime handling
-from anthropic import AsyncAnthropic, RateLimitError, APIError
-# Removed Tavily import
+# Removed Anthropic import
 import google.generativeai as genai
+from google.generativeai.types import GenerationConfig
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobServiceClient
@@ -35,30 +35,27 @@ LOCK_CONTAINER_NAME = os.environ.get("LOCK_CONTAINER_NAME", "analysis-locks")
 # Lease duration in seconds (must be between 15 and 60, or -1 for infinite)
 # Choose a duration longer than your expected max processing time.
 DEFAULT_LEASE_DURATION = 60 # seconds
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-sonnet-20240229")
+# Removed Anthropic API configuration
 # Document Intelligence configuration
 AZURE_DOCUMENTINTELLIGENCE_ENDPOINT = os.environ.get("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
 AZURE_DOCUMENTINTELLIGENCE_KEY = os.environ.get("AZURE_DOCUMENTINTELLIGENCE_KEY")
 DOC_INTELLIGENCE_MODEL = os.environ.get("DOC_INTELLIGENCE_MODEL", "prebuilt-layout")
-# Character limits for Claude input (adjust as needed, rough estimate)
-MAX_CHARS_FOR_ANALYSIS = int(os.environ.get("MAX_CHARS_FOR_ANALYSIS", "150000")) # Increased limit slightly
-# Max *output* tokens for Claude calls
-DEFAULT_ANALYSIS_MAX_TOKENS = 1500 # Increased slightly for detailed JSON
+# Character limits for analysis (adjust as needed, rough estimate)
+MAX_CHARS_FOR_ANALYSIS = int(os.environ.get("MAX_CHARS_FOR_ANALYSIS", "150000"))
 # Idempotency check window
-IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "10")) # Increased slightly
-# Removed Tavily Search API configuration
-# Google Generative AI configuration
+IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "10"))
+# Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-2.0-flash")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
 blob_service_client: Optional[BlobServiceClient] = None
-anthropic_client: Optional[AsyncAnthropic] = None
+# Removed anthropic_client
 doc_intelligence_client: Optional[DocumentIntelligenceClient] = None
-# Removed tavily_client
 gemini_model: Optional[genai.GenerativeModel] = None
+gemini_analysis_model: Optional[genai.GenerativeModel] = None
 
 # --- Supported File Extensions ---
 SUPPORTED_FILE_EXTENSIONS = [
@@ -101,16 +98,7 @@ try:
             logging.error(f"Failed to initialize Blob Service Client: {blob_err}")
             blob_service_client = None
 
-    # Anthropic Client
-    if not ANTHROPIC_API_KEY:
-        logging.warning("ANTHROPIC_API_KEY env var not set. Claude features unavailable.")
-    else:
-        try:
-            anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            logging.info(f"Anthropic client initialized for model: {CLAUDE_MODEL}")
-        except Exception as anthropic_err:
-            logging.error(f"Failed to initialize Anthropic client: {anthropic_err}")
-            anthropic_client = None
+    # Removed Anthropic Client initialization
 
     # Document Intelligence Client
     if AZURE_DOCUMENTINTELLIGENCE_ENDPOINT:
@@ -141,29 +129,45 @@ try:
         logging.warning("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT not set. Document Intelligence features unavailable.")
         doc_intelligence_client = None
 
-    # Removed Tavily Client initialization
-
-    # Google Generative AI (Gemini) Client
+    # Google Generative AI (Gemini) Client - Initialize both models
     if not GOOGLE_API_KEY:
         logging.warning("GOOGLE_API_KEY env var not set. Gemini features unavailable.")
         gemini_model = None
+        gemini_analysis_model = None
     else:
         try:
+            # Configure the API with the key
             genai.configure(api_key=GOOGLE_API_KEY)
-            gemini_model = genai.GenerativeModel(GEMINI_PROMPT_MODEL)
-            logging.info(f"Google Generative AI client initialized for model: {GEMINI_PROMPT_MODEL}")
+            
+            # Initialize prompt generation model
+            try:
+                gemini_model = genai.GenerativeModel(GEMINI_PROMPT_MODEL)
+                logging.info(f"Gemini prompt model initialized: {GEMINI_PROMPT_MODEL}")
+            except Exception as prompt_model_err:
+                logging.error(f"Failed to initialize Gemini prompt model: {prompt_model_err}", exc_info=True)
+                gemini_model = None
+            
+            # Initialize analysis model
+            try:
+                gemini_analysis_model = genai.GenerativeModel(GEMINI_ANALYSIS_MODEL)
+                logging.info(f"Gemini analysis model initialized: {GEMINI_ANALYSIS_MODEL}")
+            except Exception as analysis_model_err:
+                logging.error(f"Failed to initialize Gemini analysis model: {analysis_model_err}", exc_info=True)
+                gemini_analysis_model = None
+                
         except Exception as gemini_err:
             logging.error(f"Failed to initialize Google Generative AI client: {gemini_err}", exc_info=True)
             gemini_model = None
+            gemini_analysis_model = None
 
 except Exception as e:
     logging.error(f"Critical error during global initialization: {e}", exc_info=True)
     credential = None
     blob_service_client = None
-    anthropic_client = None
+    # Removed anthropic_client reference
     doc_intelligence_client = None
-    # tavily_client removed
     gemini_model = None
+    gemini_analysis_model = None
 
 
 # --- Helper Functions ---
@@ -442,7 +446,7 @@ async def release_blob_lease(blob_service_client: BlobServiceClient, container_n
     
     try:
         lock_blob_client = blob_service_client.get_blob_client(container_name, blob_name)
-        await lock_blob_client.release_lease(lease_id)
+        await lock_blob_client.break_lease(lease_id=lease_id)  # Changed from release_lease to break_lease with named parameter
         logging.info(f"Lease Lock: Successfully released lease '{lease_id}' on '{blob_name}'.")
         # Optional: Delete the lock blob after releasing the lease if desired
         # try:
@@ -731,62 +735,59 @@ These are the current planner tasks assigned to the document author/owner. Use t
         
         # Create the meta-prompt for Gemini (removed reference to Web Search Context)
         meta_prompt = f"""
-            Your Role: Expert Prompt Engineer for Document Analysis
+            Prompt Designer Instructions:
 
-            Your Goal: Generate a tailored, specific analysis prompt for another AI (Claude 3 Sonnet) based on the provided document information. The generated prompt should guide Claude to produce the most insightful analysis possible for the *specific* document type and content.
+            Your task is to generate a highly specific, context-aware prompt that will guide a final AI model to analyze a single working document (Word, Excel, PowerPoint, or PDF). This final prompt must instruct the AI to produce an output that is structured, objective, and sharply aligned with the document type, its content, and the full set of provided metadata (e.g., deadline, project context, review status, feedback history, document objective).
 
-            Claude's Required Output Structure (MUST be requested in the prompt you generate):
-            - CRITICAL: Claude MUST return ONLY a valid JSON object with NO surrounding text, explanations, or markdown.
-            - The JSON object MUST contain exactly these top-level keys: "summary", "technical_scores", "content_analysis", "recommendations".
-            - Do NOT include a separate 'metadata' key in your JSON output; focus only on the other requested keys.
-            - The output must start with '{{' and end with '}}' with NO text before or after.
-            - Any failure to produce precise JSON will cause errors in the processing pipeline.
-            - "summary": Claude should provide a concise 5-7 sentence summary.
-            - "technical_scores": Claude should score *relevant* metrics (which *you* will define below) on a 1-10 scale, each with a brief "reasoning".
-            - "content_analysis": Claude should identify main_topics (list), key_findings (list), writing_style (string), and target_audience (string).
-            - "recommendations": Claude should suggest 2-3 specific improvements.
+            You are not creating a one-size-fits-all prompt. You are designing a precise and tailored instruction set that forces the final AI to analyze the document in depth and in context. Your output must ensure the final AI adapts its language, scoring criteria, and recommendations to suit the specific nature and function of the document.
 
-            Input Information Provided to You for Analysis:
-            1.  Document File Type: {file_type}
-            2.  Document Content Sample: ```{content_sample}```
-            {metadata_section}
-            {planner_tasks_section}
+            Requirements for the Final Prompt You Will Generate:
+            Output Format:
 
-            Your Task (Generate the Claude Prompt - Output ONLY the prompt string):
+            Instruct the final AI to output only a structured JSON object.
 
-            STEP 1: Analyze Inputs & Infer Purpose:
-            - Examine the File Type ({file_type}), Content Sample, and any SharePoint Custom Metadata.
-            - If employee planner tasks are available, consider how the document might relate to the employee's current work.
-            - Infer the document's primary purpose and category (e.g., Technical Specification, Financial Report, Project Plan, Marketing Copy, Competitor Analysis, Legal Document, Academic Paper, Code Snippet etc.).
+            The JSON must start with {{ and end with }} — absolutely no text before or after.
 
-            STEP 2: Define Adaptive Technical Metrics for Claude:
-            - Based *only* on your inference from Step 1, choose the *most relevant set* of 4-5 metrics for Claude to evaluate in the "technical_scores" section. The goal is talent identification, so focus on skills demonstrated.
-            - **Crucially, these metrics MUST change based on the document type/purpose.** Examples:
-                - If '.xlsx' or appears financial/data-heavy: Use metrics like "Data Accuracy/Integrity", "Formula Complexity/Efficiency", "Clarity of Presentation (Charts/Tables)", "Structural Organization", "Actionability of Data".
-                - If '.docx' or appears analytical/report-like: Use metrics like "Logical Structure/Flow", "Clarity of Argument", "Evidence Quality/Support", "Depth of Analysis", "Writing Style/Professionalism".
-                - If '.pptx' or appears presentation-like: Use metrics like "Visual Design/Appeal", "Clarity of Key Messages", "Slide Structure/Flow", "Audience Appropriateness", "Information Density".
-                - If context suggests 'Competitor Analysis': Add/replace metrics with "Depth of Comparison", "Insight Novelty", "Actionability of Findings".
-                - If context suggests 'Project Plan': Use metrics like "Clarity of Objectives", "Completeness of Scope", "Risk Assessment Thoroughness", "Timeline Feasibility", "Resource Allocation Logic".
-            - **Do NOT use generic metrics for all file types.** Be specific.
+            No markdown, no formatting, no headings. Just raw JSON.
 
-            STEP 3: Determine Analysis Focus for Claude:
-            - Based on Step 1, decide the main focus for Claude's analysis.
-            - If employee planner tasks are available, instruct Claude to note any connections between the document and the tasks.
-            - *Example:* For a technical document, the generated prompt should emphasize analysis of technical depth and accuracy. For a business proposal, emphasize clarity, argument strength, and market awareness. For a spreadsheet, emphasize data structure and formula analysis.
+            Top-Level JSON Keys (MANDATORY STRUCTURE):
 
-            STEP 4: Construct the Prompt for Claude:
-            - Craft a clear, detailed prompt string addressed *to Claude*.
-            - This prompt must instruct Claude to perform the full analysis based on the *original document content it will receive separately* (remind Claude it will get this content, don't include the sample *you* saw in the final prompt).
-            - The prompt must explicitly request the JSON output with the specified structure ("summary", "technical_scores", "content_analysis", "recommendations").
-            - CRITICAL: Emphasize that Claude's response MUST be ONLY the JSON object - no introduction text, no explanation text, no markdown code blocks, just the JSON object starting with {{ and ending with }}.
-            - IMPORTANT: Explicitly instruct Claude NOT to include a 'metadata' section in its output - the metadata is provided for context only.
-            - **Most Importantly:** When instructing Claude about the "technical_scores", list the *specific, adaptive metrics* you chose in Step 2 and ask for the 1-10 score and reasoning for *each of those specific metrics*.
-            - Tailor the instructions for the "summary", "content_analysis", and "recommendations" sections to align with the inferred document purpose identified in Step 1 and the focus determined in Step 3.
-            - If employee planner tasks are provided, instruct Claude to consider these when forming recommendations - they may suggest improvements that align with the employee's current priorities or deadlines.
+            "descriptive_summary": 5–7 objective sentences describing the document’s purpose, content, and key points. Must remain neutral and not evaluative.
 
-            Output Format Restriction: Your final output must be ONLY the generated prompt string for Claude. Do not include explanations, introductions, or apologies. Start the output directly with the prompt text for Claude.
+            "technical_summary": 3–5 sentences critically evaluating the quality and effectiveness of the document, based on its type and intended function.
 
-            Generate the tailored prompt for Claude now:
+            "technical_scores": Exactly 5 metrics scored on a 1–10 scale, with brief, targeted justifications. These metrics must be document-type-specific (see below).
+
+            "recommendations": 2–3 clear, actionable suggestions to improve the document. These should reflect both its type and the project/review context found in the metadata.
+
+            Scoring Metric Guidelines (adapt based on document type):
+
+            Excel/Data-Heavy (.xlsx):
+            "Data Accuracy/Integrity", "Formula Complexity/Efficiency", "Clarity of Presentation (Charts/Tables)", "Structural Organization", "Actionability of Data"
+
+            Word/Analytical Reports (.docx):
+            "Logical Structure/Flow", "Clarity of Argument", "Evidence Quality/Support", "Depth of Analysis", "Writing Style/Professionalism"
+
+            PowerPoint/Presentations (.pptx):
+            "Visual Design/Appeal", "Clarity of Key Messages", "Slide Structure/Flow", "Audience Appropriateness", "Information Density"
+
+            PDF or Mixed-Type Documents:
+            Instruct the AI to choose 4–5 metrics most relevant to the content and context — e.g., formatting quality, clarity, usability, analytical depth, etc.
+
+            Alignment with Metadata Context:
+
+            Instruct the final AI to incorporate metadata into all evaluative components — especially the "technical_summary" and "recommendations".
+
+            If a document is part of a draft cycle, under review, or linked to a specific deadline or objective, this must directly influence the tone and content of the evaluation.
+
+            Scoring should reflect expectations based on the document’s stage, role, and use-case in the project.
+
+            Enforcement of Strict Format Compliance:
+
+            Reinforce that any deviation from the defined JSON structure, or inclusion of additional text, invalidates the output.
+
+            Your Output:
+            Generate a targeted and context-aware prompt that includes all the above constraints, tailored to the specific document type and the full metadata. It should push the final AI to deliver a precise, useful, and context-grounded evaluation, not a generic assessment.
         """
         
         logging.info(f"Gemini: Generating dynamic prompt for {file_type} document with custom metadata: {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} fields and {len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")
@@ -810,20 +811,20 @@ These are the current planner tasks assigned to the document author/owner. Use t
         return error_msg
 
 
-# --- Modified to include SharePoint metadata and Planner tasks ---
-async def analyze_with_claude_context_prompt(
+# --- Gemini Analysis Function ---
+async def analyze_with_gemini_dynamic(
+    dynamic_prompt: str,
     content: str, 
-    dynamic_prompt: str, 
     file_name: str,
     sharepoint_custom_metadata: Optional[Dict[str, Any]] = None,
     employee_planner_tasks: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """ 
-    Analyzes document markdown content using Claude with dynamic prompt. 
+    Analyzes document content using Gemini with dynamic prompt. 
     
     Args:
+        dynamic_prompt: Generated dynamic prompt from first Gemini call
         content: The document content in markdown format
-        dynamic_prompt: Generated dynamic prompt from Gemini
         file_name: Name of the file being analyzed
         sharepoint_custom_metadata: Optional SharePoint custom metadata for context enhancement
         employee_planner_tasks: Optional list of employee's planner tasks for context
@@ -831,27 +832,24 @@ async def analyze_with_claude_context_prompt(
     Returns:
         Dict containing analysis results or error information
     """
-    if not anthropic_client:
-        error_msg = "Anthropic client not initialized"
+    if not gemini_analysis_model:
+        error_msg = "Gemini analysis model not initialized"
         logging.error(error_msg)
-        raise RuntimeError(error_msg)
-    if not content or content.startswith("[Error:"):
-         logging.warning(f"Claude Analysis: Skipping analysis due to empty or error content: {content}")
-         return {
-             "status": "skipped_no_content",
-             "error": "No valid content provided for analysis.",
-             "analysis_text": content
-         }
+        return {
+            "status": "initialization_error",
+            "error": error_msg
+        }
+
     try:
         content_to_analyze = content
         if len(content) > MAX_CHARS_FOR_ANALYSIS:
-            logging.warning(f"Claude Analysis: Truncating content from {len(content)} to {MAX_CHARS_FOR_ANALYSIS} characters.")
+            logging.warning(f"Gemini Analysis: Truncating content from {len(content)} to {MAX_CHARS_FOR_ANALYSIS} characters.")
             content_to_analyze = content[:MAX_CHARS_FOR_ANALYSIS]
 
-        logging.info(f"Claude Analysis: Sending {len(content_to_analyze)} characters for analysis with {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} custom metadata fields and {len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")
+        logging.info(f"Gemini Analysis: Sending {len(content_to_analyze)} characters for analysis with "
+                     f"{len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} custom metadata fields and "
+                     f"{len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")
 
-        system_prompt = "You are an AI document analyst executing the user's request precisely. Respond ONLY with a valid JSON object matching the requested structure, with no surrounding text or markdown."
-        
         # Generate metadata section if available
         metadata_section = ""
         if sharepoint_custom_metadata and len(sharepoint_custom_metadata) > 0:
@@ -870,139 +868,109 @@ EMPLOYEE PLANNER TASKS:
 Consider the author's current tasks and priorities when analyzing this document.
 """
         
-        user_message = ""
-        
-        if dynamic_prompt.startswith("GEMINI_"):
-            logging.warning(f"Claude Analysis: Using default prompt due to Gemini error: {dynamic_prompt}")
-            # Fallback prompt (without search context but with metadata if available)
-            user_message = f"""
-            Please analyze the following document content in markdown format and generate a structured analysis.
-            
-            {metadata_section}
-            {planner_tasks_section}
-            
-            DOCUMENT CONTENT:
-            {content_to_analyze}
-            
-            Please format your response as a JSON object with these components:
-            - summary: A concise 5-7 sentence summary
-            - technical_scores: Score overall_quality, structure, clarity, technical_depth, visual_elements on a 1-10 scale with brief reasoning.
-            - content_analysis: Identify main_topics (list), key_findings (list), writing_style (string), target_audience (string).
-            - recommendations: Suggest 2-3 improvements.
-            
-            IMPORTANT: Respond ONLY with the JSON object, starting with {{ and ending with }}. No other text.
-            The required top-level keys are exactly: summary, technical_scores, content_analysis, recommendations.
-            Do NOT include any other keys, including 'metadata'.
-            """
-        else:
-            # Use dynamic prompt with metadata section
-            user_message = f"""
-            {metadata_section}
-            {planner_tasks_section}
-            
-            DOCUMENT CONTENT:
-            {content_to_analyze}
-            
-            {dynamic_prompt} 
-            """ # Dynamic prompt already contains instructions for JSON format
+        # Construct the complete analysis prompt
+        final_analysis_prompt = f"""
+{metadata_section}
+{planner_tasks_section}
 
-        response = await anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=DEFAULT_ANALYSIS_MAX_TOKENS,
-            system=system_prompt, # System prompt reinforces JSON-only output
-            messages=[{"role": "user", "content": user_message}]
+DOCUMENT CONTENT:
+{content_to_analyze}
+
+{dynamic_prompt}
+"""
+
+        # Configure Gemini to return JSON
+        generation_config = GenerationConfig(
+            response_mime_type="application/json"
         )
-
-        if response.content and isinstance(response.content, list) and hasattr(response.content[0], 'text'):
-            analysis_text = response.content[0].text.strip()
-            logging.debug(f"Claude raw response text: {analysis_text[:500]}...")
-
-            try:
-                # Attempt to parse directly as JSON first (most common expected case)
-                json_match = json.loads(analysis_text)
-                logging.info("Claude Analysis: Successfully parsed direct JSON response.")
-
-            except json.JSONDecodeError as json_err_direct:
-                 logging.warning(f"Claude Analysis: Failed direct JSON parse ({json_err_direct}). Checking for markdown block...")
-                 json_match = None # Reset match
-                 # Check for markdown block as a fallback
-                 if "```json" in analysis_text:
-                    try:
-                        json_part = analysis_text.split("```json", 1)[1].split("```", 1)[0].strip()
-                        json_match = json.loads(json_part)
-                        logging.info("Claude Analysis: Successfully extracted and parsed JSON from markdown block.")
-                    except (IndexError, json.JSONDecodeError) as json_err_block:
-                         logging.error(f"Claude JSON Parse Error: Failed to parse JSON from block after direct parse failed. Error: {json_err_block}")
-                         logging.error(f"Claude JSON Parse Error: Raw text was: {analysis_text}")
-                         # If both fail, raise the original direct parse error to be caught below
-                         raise json_err_direct from json_err_block
-                 else:
-                      # If no markdown block and direct parse failed, raise the direct error
-                      logging.error(f"Claude JSON Parse Error: Direct parse failed and no JSON markdown block detected.")
-                      logging.error(f"Claude JSON Parse Error: Raw text was: {analysis_text}")
-                      raise json_err_direct
-
-            # If json_match is successfully populated (either directly or from block)
-            if json_match:
-                required_keys = ["summary", "technical_scores", "content_analysis", "recommendations"]
-                if all(key in json_match for key in required_keys):
-                     # Remove metadata if present - we don't want it
-                     if "metadata" in json_match:
-                         logging.warning("Claude Analysis: Removing 'metadata' key found in response despite instructions not to include it")
-                         del json_match["metadata"]
-                     return json_match
-                else:
-                     missing_keys = [key for key in required_keys if key not in json_match]
-                     logging.error(f"Claude Analysis: Parsed JSON missing required keys: {missing_keys}. Found: {list(json_match.keys())}")
-                     return {
-                        "status": "claude_format_error",
-                        "error": f"Parsed JSON missing required keys: {missing_keys}",
-                        "analysis_text": analysis_text, # Keep original text for debugging
-                        "parsed_keys": list(json_match.keys())
-                     }
-
-            # This part should theoretically not be reached if parsing fails, as errors are raised
-            # Kept as a safety net, but the raise above is preferred.
-            else: # Should not happen if logic above is correct
-                 logging.error("Claude Analysis: JSON parsing failed unexpectedly after checks.")
-                 return {
-                    "status": "claude_json_error",
-                    "error": "Failed to parse Claude response as JSON after checks.",
-                    "analysis_text": analysis_text,
-                    "raw_response": analysis_text
-                 }
-
-        # Handle cases where the response structure itself is invalid
-        else:
-            error_msg = "Claude Analysis: Unexpected empty or invalid response structure from API."
-            logging.error(f"{error_msg} Raw response: {response}")
-            raw_response_str = str(response) if response else "None"
-            return {"status": "claude_api_error", "error": error_msg, "raw_response": raw_response_str[:1000]}
-
-    # Specific API errors
-    except RateLimitError as rle:
-        error_msg = f"Claude Analysis: Rate limit error: {str(rle)}"
+        
+        logging.info("Gemini Analysis: Sending analysis request to Gemini")
+        
+        # Send request to Gemini
+        response = await gemini_analysis_model.generate_content_async(
+            final_analysis_prompt, 
+            generation_config=generation_config
+        )
+        
+        # Check if response was successful
+        if not response or not hasattr(response, 'candidates') or not response.candidates:
+            logging.error("Gemini Analysis: Empty or invalid response received")
+            return {
+                "status": "gemini_response_error",
+                "error": "Empty or invalid response from Gemini",
+                "raw_response": str(response) if response else "None"
+            }
+            
+        # Check finish reason
+        finish_reason = response.candidates[0].finish_reason
+        if finish_reason != "STOP":
+            logging.warning(f"Gemini Analysis: Response didn't complete normally. Finish reason: {finish_reason}")
+            
+        # Extract response text
+        if not hasattr(response, 'text'):
+            logging.error("Gemini Analysis: Response missing text attribute")
+            return {
+                "status": "gemini_format_error",
+                "error": "Response missing text attribute",
+                "raw_response": str(response)
+            }
+            
+        analysis_text = response.text.strip()
+        logging.debug(f"Gemini raw response text: {analysis_text[:500]}...")
+        
+        try:
+            # Attempt to parse as JSON
+            json_match = json.loads(analysis_text)
+            logging.info("Gemini Analysis: Successfully parsed JSON response.")
+            
+            # Validate required keys
+            required_keys = ["summary", "technical_scores", "content_analysis", "recommendations"]
+            if all(key in json_match for key in required_keys):
+                # Remove metadata if present - we don't want it
+                if "metadata" in json_match:
+                    logging.warning("Gemini Analysis: Removing 'metadata' key found in response despite instructions not to include it")
+                    del json_match["metadata"]
+                return json_match
+            else:
+                missing_keys = [key for key in required_keys if key not in json_match]
+                logging.error(f"Gemini Analysis: Parsed JSON missing required keys: {missing_keys}. Found: {list(json_match.keys())}")
+                return {
+                    "status": "gemini_format_error",
+                    "error": f"Parsed JSON missing required keys: {missing_keys}",
+                    "analysis_text": analysis_text, # Keep original text for debugging
+                    "parsed_keys": list(json_match.keys())
+                }
+                
+        except json.JSONDecodeError as json_err:
+            logging.error(f"Gemini Analysis: Failed to parse response as JSON: {json_err}")
+            return {
+                "status": "gemini_json_error",
+                "error": f"Failed to parse Gemini response as JSON: {str(json_err)}",
+                "analysis_text": analysis_text,
+                "raw_response": analysis_text
+            }
+            
+    except genai.RateLimitError as rle:
+        error_msg = f"Gemini Analysis: Rate limit error: {str(rle)}"
         logging.error(error_msg)
-        raise RuntimeError(error_msg) from rle
-    except APIError as api_err:
-        error_msg = f"Claude Analysis: API error: {str(api_err)}"
-        logging.error(error_msg)
-        raise RuntimeError(error_msg) from api_err
-    # General JSON parsing errors raised from within the try block
-    except json.JSONDecodeError as json_err:
-        logging.error(f"Claude Analysis: Failed to parse response as JSON: {json_err}")
-        # analysis_text is available in this scope from the initial API response check
         return {
-            "status": "claude_json_error",
-            "error": f"Failed to parse Claude response as JSON: {str(json_err)}",
-            "analysis_text": analysis_text if 'analysis_text' in locals() else "Raw text unavailable",
-            "raw_response": analysis_text if 'analysis_text' in locals() else "Raw text unavailable"
+            "status": "gemini_rate_limit_error",
+            "error": error_msg
         }
-    # Other unexpected errors
+    except genai.APIError as api_err:
+        error_msg = f"Gemini Analysis: API error: {str(api_err)}"
+        logging.error(error_msg)
+        return {
+            "status": "gemini_api_error",
+            "error": error_msg
+        }
     except Exception as e:
-        error_msg = f"Claude Analysis: Unexpected error: {str(e)}"
+        error_msg = f"Gemini Analysis: Unexpected error: {str(e)}"
         logging.error(error_msg, exc_info=True)
-        raise RuntimeError(error_msg) from e
+        return {
+            "status": "gemini_unexpected_error",
+            "error": error_msg
+        }
 
 
 # --- Main Function ---
@@ -1082,14 +1050,11 @@ async def main(msg: func.QueueMessage) -> None:
             logging.warning(f"{msg_id}: Blob storage client unavailable - skipping idempotency check")
 
         logging.info(f"{msg_id}: Checking required client initializations.")
-        # Removed tavily check
-        if not doc_intelligence_client or not anthropic_client or not credential or not blob_service_client or not gemini_model:
+        if not doc_intelligence_client or not gemini_model or not gemini_analysis_model:
             error_parts = []
             if not doc_intelligence_client: error_parts.append("Document Intelligence client missing.")
-            if not anthropic_client: error_parts.append("Anthropic client missing.")
-            if not credential: error_parts.append("Azure credential missing.")
-            if not blob_service_client: error_parts.append("Blob service client missing.")
-            if not gemini_model: error_parts.append("Gemini client missing.") # Added Gemini check here
+            if not gemini_model: error_parts.append("Gemini prompt model missing.")
+            if not gemini_analysis_model: error_parts.append("Gemini analysis model missing.")
             error_msg = f"{msg_id}: Prerequisite client(s) not initialized. " + " ".join(error_parts)
             logging.error(error_msg)
             await store_result({
@@ -1152,75 +1117,27 @@ async def main(msg: func.QueueMessage) -> None:
         except Exception as metadata_err:
             logging.warning(f"{msg_id}: Error retrieving SharePoint metadata (continuing without it): {metadata_err}")
             # We continue processing even if metadata retrieval fails
-            
+
         # --- Fetch Employee Planner Tasks (New Step) ---
         try:
-            # Extract author email from SharePoint metadata if available
-            author_email = None
-            
-            # Common SharePoint author field names with their typical encoding in Graph API responses
-            # These need to be adjusted based on your specific SharePoint column names
-            potential_author_fields = [
-                "Autore_x002f_i",  # "Author/s" in Italian SharePoint
-                "Author0",         # Sometimes used for Author
-                "EditorId",        # Editor reference
-                "Created_x0020_By" # Created By field
-            ]
-            
-            logging.info(f"{msg_id}: Attempting to extract author email from SharePoint metadata with keys: {list(sharepoint_custom_metadata.keys())}")
-            
-            # Check for author fields that might contain the email
-            for field_name in potential_author_fields:
-                if field_name in sharepoint_custom_metadata:
-                    field_value = sharepoint_custom_metadata[field_name]
-                    logging.info(f"{msg_id}: Found potential author field '{field_name}' with value type: {type(field_value)}")
+            # Check directly for the specific Autore_x002f_i field
+            if 'Autore_x002f_i' in sharepoint_custom_metadata:
+                author_field = sharepoint_custom_metadata['Autore_x002f_i']
+                logging.info(f"{msg_id}: Found 'Autore_x002f_i' field with value type: {type(author_field)}")
+                
+                # Check if the field has the expected structure (list of dictionaries)
+                if isinstance(author_field, list) and len(author_field) > 0 and isinstance(author_field[0], dict):
+                    # Extract email from the first entry
+                    author_email = author_field[0].get('Email')
                     
-                    try:
-                        # Case 1: Value is a list containing dictionaries (common SharePoint person field format)
-                        if isinstance(field_value, list) and len(field_value) > 0:
-                            first_entry = field_value[0]
-                            logging.info(f"{msg_id}: Field '{field_name}' contains a list with first entry type: {type(first_entry)}")
-                            
-                            if isinstance(first_entry, dict):
-                                # Try to extract email from various possible keys
-                                for email_key in ['Email', 'email', 'EMail', 'EmailAddress', 'UserEmail']:
-                                    if email_key in first_entry and first_entry[email_key]:
-                                        author_email = first_entry[email_key]
-                                        logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}[0].{email_key}'")
-                                        break
-                                
-                                # If no direct email key, try LookupValue which might contain email
-                                if not author_email and 'LookupValue' in first_entry:
-                                    lookup_value = first_entry['LookupValue']
-                                    if isinstance(lookup_value, str) and '@' in lookup_value:
-                                        author_email = lookup_value
-                                        logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}[0].LookupValue'")
-                        
-                        # Case 2: Value is a dictionary (another common format)
-                        elif isinstance(field_value, dict):
-                            # Try to extract email from various possible keys
-                            for email_key in ['Email', 'email', 'EMail', 'EmailAddress', 'UserEmail']:
-                                if email_key in field_value and field_value[email_key]:
-                                    author_email = field_value[email_key]
-                                    logging.info(f"{msg_id}: Extracted email '{author_email}' from '{field_name}.{email_key}'")
-                                    break
-                        
-                        # Case 3: Value is a string that might be an email
-                        elif isinstance(field_value, str) and '@' in field_value:
-                            author_email = field_value
-                            logging.info(f"{msg_id}: Field '{field_name}' directly contains what appears to be an email: '{author_email}'")
-                        
-                        # If we found an email, no need to check other fields
-                        if author_email:
-                            break
-                            
-                    except Exception as extract_err:
-                        logging.warning(f"{msg_id}: Error extracting email from field '{field_name}': {extract_err}")
-                        continue
-            
-            # If no email found through specific fields, dump the metadata for debugging
-            if not author_email:
-                logging.info(f"{msg_id}: Could not identify author email from metadata. Available fields: {list(sharepoint_custom_metadata.keys())}")
+                    if author_email:
+                        logging.info(f"{msg_id}: Successfully extracted author email '{author_email}' from 'Autore_x002f_i[0].Email'")
+                    else:
+                        logging.warning(f"{msg_id}: 'Email' key not found in 'Autore_x002f_i[0]' dictionary: {author_field[0]}")
+                else:
+                    logging.warning(f"{msg_id}: 'Autore_x002f_i' field has unexpected structure: {author_field}")
+            else:
+                logging.warning(f"{msg_id}: 'Autore_x002f_i' field not found in SharePoint metadata. Available fields: {list(sharepoint_custom_metadata.keys())}")
                 logging.debug(f"{msg_id}: Full SharePoint custom metadata for debugging: {json.dumps(sharepoint_custom_metadata)}")
             
             if author_email:
@@ -1304,7 +1221,6 @@ async def main(msg: func.QueueMessage) -> None:
                         logging.info(f"{msg_id}: Entering main processing block (lock acquired).")
 
                         # Step 1: Extract markdown content
-                        # ... (Document Intelligence logic remains the same) ...
                         markdown_content = await extract_markdown_with_doc_intelligence(file_content_bytes)
                         if markdown_content is None or markdown_content.startswith("[Error:"):
                             # Handle extraction failure, set status
@@ -1319,19 +1235,25 @@ async def main(msg: func.QueueMessage) -> None:
                             sharepoint_custom_metadata=sharepoint_custom_metadata,
                             employee_planner_tasks=employee_planner_tasks
                         )
-                        # Allow fallback if Gemini fails, maybe log warning but don't fail unless critical
 
-                        # Step 3: Analyze with Claude using dynamic prompt
-                        analysis_result = await analyze_with_claude_context_prompt(
-                            content=markdown_content,
-                            dynamic_prompt=dynamic_prompt,
-                            file_name=file_name,
-                            sharepoint_custom_metadata=sharepoint_custom_metadata,
-                            employee_planner_tasks=employee_planner_tasks
-                        )
-                        if analysis_result is None or (isinstance(analysis_result, dict) and analysis_result.get("error")):
-                            final_status = "claude_analysis_error"
-                            raise RuntimeError(f"Claude analysis failed: {analysis_result.get('error', 'Unknown Claude Error')}")
+                        # Step 3: Analyze with Gemini using dynamic prompt
+                        # Make sure dynamic_prompt was successfully generated before proceeding
+                        if dynamic_prompt and not dynamic_prompt.startswith("GEMINI_GENERATION_FAILED"):
+                            analysis_result = await analyze_with_gemini_dynamic(
+                                dynamic_prompt=dynamic_prompt,
+                                content=markdown_content,
+                                file_name=file_name,
+                                sharepoint_custom_metadata=sharepoint_custom_metadata,
+                                employee_planner_tasks=employee_planner_tasks
+                            )
+                            if analysis_result is None or (isinstance(analysis_result, dict) and analysis_result.get("error")):
+                                final_status = "gemini_analysis_error"
+                                raise RuntimeError(f"Gemini analysis failed: {analysis_result.get('error', 'Unknown Gemini Error')}")
+                        else:
+                            # Handle case where dynamic prompt generation failed
+                            logging.error(f"{msg_id}: Skipping analysis because dynamic prompt generation failed: {dynamic_prompt}")
+                            final_status = "gemini_prompt_error"
+                            raise RuntimeError(f"Dynamic prompt generation failed: {dynamic_prompt}")
 
 
                         # Success Case
@@ -1367,7 +1289,7 @@ async def main(msg: func.QueueMessage) -> None:
 
                     except Exception as processing_error:
                         # --- Error Handling within Lock ---
-                        # Status might already be set (e.g., doc_intelligence_error, claude_analysis_error)
+                        # Status might already be set (e.g., doc_intelligence_error, gemini_analysis_error)
                         if final_status == "processing_failed": # If not set by specific step failure
                             final_status = "processing_failed" # Keep or refine based on error type
 
@@ -1383,7 +1305,7 @@ async def main(msg: func.QueueMessage) -> None:
                             "employee_planner_tasks": employee_planner_tasks,
                             "intermediate_markdown_sample": (markdown_content[:1000] + "..." if isinstance(markdown_content, str) and len(markdown_content) > 1000 else markdown_content) if markdown_content else None,
                             "dynamic_prompt": dynamic_prompt[:1000] + "..." if dynamic_prompt and len(dynamic_prompt) > 1000 else dynamic_prompt,
-                            "raw_claude_response": analysis_result.get("raw_response", None) if isinstance(analysis_result, dict) and "raw_response" in analysis_result else None,
+                            "raw_gemini_response": analysis_result.get("raw_response", None) if isinstance(analysis_result, dict) and "raw_response" in analysis_result else None,
                             "timestamp_utc": pendulum.now('UTC').to_iso8601_string()
                         }
                         await store_result(error_result_data, item_id, tenant_id)
