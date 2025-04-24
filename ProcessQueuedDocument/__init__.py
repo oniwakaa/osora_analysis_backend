@@ -48,7 +48,7 @@ IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "1
 # Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
-GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-flash-latest")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
