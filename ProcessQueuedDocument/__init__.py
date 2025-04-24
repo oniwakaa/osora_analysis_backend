@@ -47,8 +47,8 @@ MAX_CHARS_FOR_ANALYSIS = int(os.environ.get("MAX_CHARS_FOR_ANALYSIS", "150000"))
 IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "10"))
 # Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
-GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-2.0-flash")
+GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
@@ -570,11 +570,12 @@ async def get_user_id_from_email(email: str, access_token: str) -> Optional[str]
 
 
 # --- Helper Function: Planner Tasks Retrieval ---
-async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Dict[str, Any]]:
+async def get_employee_planner_tasks(plan_id: Optional[str], user_id: str, access_token: str) -> List[Dict[str, Any]]:
     """
     Retrieves Planner tasks assigned to a user from Microsoft Graph API.
     
     Args:
+        plan_id: Optional Plan ID to filter tasks to a specific plan
         user_id: The Azure AD user ID
         access_token: Microsoft Graph API access token
         
@@ -586,10 +587,15 @@ async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Di
         return []
     
     try:
-        # Construct API URL to get tasks assigned to the specific user
-        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignedToUser eq '{user_id}'&$expand=details"
-        
-        logging.info(f"Planner Tasks: Querying Graph API for tasks assigned to user: {user_id}")
+        # Construct API URL based on whether we have a plan_id
+        if plan_id:
+            # If we have a plan_id, get tasks from that specific plan and expand details and assignments
+            tasks_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}/tasks?$expand=details,assignments"
+            logging.info(f"Planner Tasks: Querying Graph API for tasks in plan: {plan_id}")
+        else:
+            # If no plan_id, fall back to getting all tasks assigned to the user
+            tasks_url = f"{GRAPH_API_ENDPOINT}/planner/tasks?$filter=assignedToUser eq '{user_id}'&$expand=details"
+            logging.info(f"Planner Tasks: Querying Graph API for tasks assigned to user: {user_id}")
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -602,9 +608,20 @@ async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Di
                 tasks_data = response.json()
                 tasks = tasks_data.get('value', [])
                 
-                # Process and structure the task data
+                # Process and filter tasks
                 formatted_tasks = []
+                
                 for task in tasks:
+                    # If we queried by plan, we need to check if this task is assigned to our user
+                    if plan_id:
+                        # Get the assignments dictionary
+                        assignments = task.get('assignments', {})
+                        # Check if our user is in the assignments
+                        if not any(assignment.get('assignedTo', {}).get('user', {}).get('id') == user_id 
+                                   for assignment in assignments.values() if isinstance(assignment, dict)):
+                            # Skip tasks not assigned to our user
+                            continue
+                    
                     task_details = task.get('details', {})
                     
                     formatted_task = {
@@ -623,19 +640,20 @@ async def get_employee_planner_tasks(user_id: str, access_token: str) -> List[Di
                     # Add task to the formatted list
                     formatted_tasks.append(formatted_task)
                 
-                logging.info(f"Planner Tasks: Retrieved {len(formatted_tasks)} tasks for user {user_id}")
+                logging.info(f"Planner Tasks: Retrieved {len(formatted_tasks)} tasks for user {user_id}" + 
+                            (f" in plan {plan_id}" if plan_id else ""))
                 
                 # Try to enrich with plan and bucket names if tasks exist
                 if formatted_tasks:
                     try:
                         # Get a sample task to fetch plan and bucket details
                         sample_task = tasks[0]
-                        plan_id = sample_task.get('planId')
+                        sample_plan_id = sample_task.get('planId')
                         bucket_id = sample_task.get('bucketId')
                         
-                        if plan_id:
+                        if sample_plan_id:
                             # Get plan details
-                            plan_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}"
+                            plan_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{sample_plan_id}"
                             plan_response = await client.get(
                                 plan_url,
                                 headers={"Authorization": f"Bearer {access_token}"},
@@ -976,6 +994,125 @@ DOCUMENT CONTENT:
         }
 
 
+async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str]:
+    """
+    Find the Microsoft 365 Group ID associated with a SharePoint site.
+    
+    Args:
+        site_id: The SharePoint site ID
+        access_token: Microsoft Graph API access token
+        
+    Returns:
+        Optional[str]: The Group ID if found, otherwise None
+    """
+    if not site_id or not access_token:
+        logging.warning("Group ID: Missing required parameters - Site ID: " + 
+                        f"{'present' if site_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
+        return None
+    
+    try:
+        # Ensure site_id is properly encoded for URL
+        encoded_site_id = urllib.parse.quote(site_id)
+        graph_url = f"{GRAPH_API_ENDPOINT}/sites/{encoded_site_id}?$select=id&$expand=group($select=id)"
+        
+        logging.info(f"Group ID: Querying Graph API for group associated with site: {site_id}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                graph_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                site_data = response.json()
+                group = site_data.get('group')
+                
+                if group and 'id' in group:
+                    group_id = group['id']
+                    logging.info(f"Group ID: Found group ID '{group_id}' for site '{site_id}'")
+                    return group_id
+                else:
+                    logging.warning(f"Group ID: No group associated with site '{site_id}'")
+                    return None
+            else:
+                logging.error(f"Group ID: Failed with status code {response.status_code}")
+                if response.text:
+                    logging.error(f"Group ID: Error response: {response.text[:500]}")
+                return None
+                
+    except Exception as e:
+        logging.error(f"Group ID: Error retrieving group ID for site '{site_id}': {str(e)}", exc_info=True)
+        return None
+
+
+async def get_plan_id_from_group(group_id: str, access_token: str) -> Optional[str]:
+    """
+    Find a Planner Plan ID associated with a Microsoft 365 Group.
+    
+    Args:
+        group_id: The Microsoft 365 Group ID
+        access_token: Microsoft Graph API access token
+        
+    Returns:
+        Optional[str]: The Plan ID if found, otherwise None
+    """
+    if not group_id or not access_token:
+        logging.warning("Plan ID: Missing required parameters - Group ID: " + 
+                        f"{'present' if group_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
+        return None
+    
+    try:
+        graph_url = f"{GRAPH_API_ENDPOINT}/groups/{group_id}/planner/plans?$select=id,title"
+        
+        logging.info(f"Plan ID: Querying Graph API for plans in group: {group_id}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                graph_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                plan_data = response.json()
+                plans = plan_data.get('value', [])
+                
+                if not plans:
+                    logging.warning(f"Plan ID: No plans found for group '{group_id}'")
+                    return None
+                    
+                if len(plans) == 1:
+                    plan_id = plans[0].get('id')
+                    plan_title = plans[0].get('title', 'Unknown')
+                    logging.info(f"Plan ID: Found single plan '{plan_title}' with ID '{plan_id}' for group '{group_id}'")
+                    return plan_id
+                    
+                # If multiple plans, log them and select the first one
+                # This is a simplified selection strategy
+                logging.info(f"Plan ID: Found {len(plans)} plans for group '{group_id}':")
+                for idx, plan in enumerate(plans):
+                    plan_id = plan.get('id')
+                    plan_title = plan.get('title', 'Unknown')
+                    logging.info(f"  {idx+1}. Plan '{plan_title}' with ID '{plan_id}'")
+                
+                # Default to first plan
+                selected_plan = plans[0]
+                plan_id = selected_plan.get('id')
+                plan_title = selected_plan.get('title', 'Unknown')
+                logging.info(f"Plan ID: Selected plan '{plan_title}' with ID '{plan_id}' (first in list)")
+                return plan_id
+            else:
+                logging.error(f"Plan ID: Failed with status code {response.status_code}")
+                if response.text:
+                    logging.error(f"Plan ID: Error response: {response.text[:500]}")
+                return None
+                
+    except Exception as e:
+        logging.error(f"Plan ID: Error retrieving plans for group '{group_id}': {str(e)}", exc_info=True)
+        return None
+
+
 # --- Main Function ---
 async def main(msg: func.QueueMessage) -> None:
     """Azure Function entry point for processing queue messages."""
@@ -994,6 +1131,9 @@ async def main(msg: func.QueueMessage) -> None:
     sharepoint_internal_metadata = {} # Initialize internal SharePoint metadata
     employee_user_id = None # Initialize employee user ID
     employee_planner_tasks = [] # Initialize employee planner tasks
+    site_id = None # Initialize site ID
+    group_id = None # Initialize group ID
+    plan_id = None # Initialize plan ID
 
     logging.info(f"{msg_id}: ----- Function execution started -----")
 
@@ -1013,6 +1153,14 @@ async def main(msg: func.QueueMessage) -> None:
         drive_id = data.get('driveId')
         item_id = data.get('itemId', 'unknown')
         file_name = data.get('fileName', 'unknown')
+        
+        # Extract site ID from the incoming message
+        site_id = data.get('siteId')
+        if site_id:
+            logging.info(f"{msg_id}: Found SharePoint site ID in message: '{site_id}'")
+        else:
+            logging.info(f"{msg_id}: No SharePoint site ID found in message")
+            
         logging.info(f"{msg_id}: Extracted document info - Tenant: '{tenant_id}', Drive: '{drive_id}', Item: '{item_id}', File: '{file_name}'")
 
         if not all([tenant_id != "unknown", drive_id, item_id != "unknown", file_name != "unknown"]):
@@ -1024,6 +1172,11 @@ async def main(msg: func.QueueMessage) -> None:
             "file_name": file_name, "message_id": msg_id,
             "processed_at_utc": function_start_time.to_iso8601_string()
         }
+        
+        # Add site_id to metadata if available
+        if site_id:
+            item_metadata["site_id"] = site_id
+            
         logging.info(f"{msg_id}: Metadata extraction complete.")
 
         logging.info(f"{msg_id}: Checking file extension.")
@@ -1078,6 +1231,29 @@ async def main(msg: func.QueueMessage) -> None:
             }, item_id, tenant_id)
             return
 
+        # --- Look up Group ID and Plan ID from Site ID (if available) ---
+        if site_id and access_token:
+            try:
+                logging.info(f"{msg_id}: Looking up Group ID for SharePoint site ID: {site_id}")
+                group_id = await get_group_id_for_site(site_id, access_token)
+                
+                if group_id:
+                    logging.info(f"{msg_id}: Found Group ID: {group_id}")
+                    
+                    # Now look up the Plan ID from the Group ID
+                    logging.info(f"{msg_id}: Looking up Plan ID for Group ID: {group_id}")
+                    plan_id = await get_plan_id_from_group(group_id, access_token)
+                    
+                    if plan_id:
+                        logging.info(f"{msg_id}: Found Plan ID: {plan_id}")
+                    else:
+                        logging.info(f"{msg_id}: No Plan ID found for Group ID: {group_id}")
+                else:
+                    logging.info(f"{msg_id}: No Group ID found for SharePoint site ID: {site_id}")
+            except Exception as site_lookup_err:
+                logging.warning(f"{msg_id}: Error looking up Group/Plan ID from Site ID: {site_lookup_err}")
+                # Continue processing even if lookup fails
+
         # --- Fetch SharePoint Metadata (New Step) ---
         try:
             sharepoint_fields = await get_sharepoint_metadata(drive_id, item_id, access_token)
@@ -1121,8 +1297,10 @@ async def main(msg: func.QueueMessage) -> None:
             logging.warning(f"{msg_id}: Error retrieving SharePoint metadata (continuing without it): {metadata_err}")
             # We continue processing even if metadata retrieval fails
 
-        # --- Fetch Employee Planner Tasks (New Step) ---
+        # --- Fetch Employee Planner Tasks (Updated Step) ---
         try:
+            author_email = None
+            
             # Check directly for the specific Autore_x002f_i field
             if 'Autore_x002f_i' in sharepoint_custom_metadata:
                 author_field = sharepoint_custom_metadata['Autore_x002f_i']
@@ -1151,7 +1329,14 @@ async def main(msg: func.QueueMessage) -> None:
                     logging.info(f"{msg_id}: Retrieved user ID for author: {employee_user_id}")
                     
                     # Get the planner tasks for the author
-                    employee_planner_tasks = await get_employee_planner_tasks(employee_user_id, access_token)
+                    if plan_id:
+                        # If we have a plan_id from the site, use it to filter tasks
+                        logging.info(f"{msg_id}: Using Plan ID from site to get tasks: {plan_id}")
+                        employee_planner_tasks = await get_employee_planner_tasks(plan_id, employee_user_id, access_token)
+                    else:
+                        # Otherwise fall back to getting all tasks for the user
+                        logging.info(f"{msg_id}: No Plan ID available, getting all tasks for user")
+                        employee_planner_tasks = await get_employee_planner_tasks(None, employee_user_id, access_token)
                     
                     if employee_planner_tasks:
                         logging.info(f"{msg_id}: Retrieved {len(employee_planner_tasks)} planner tasks for author")
@@ -1277,6 +1462,9 @@ async def main(msg: func.QueueMessage) -> None:
                             "sharepoint_custom_metadata": sharepoint_custom_metadata,
                             "sharepoint_internal_metadata": sharepoint_internal_metadata,
                             "employee_planner_tasks": employee_planner_tasks,
+                            "sharepoint_site_id": site_id,  # Include SharePoint site ID if available
+                            "m365_group_id": group_id,      # Include Microsoft 365 Group ID if available
+                            "planner_plan_id": plan_id,     # Include Planner Plan ID if available
                             "metadata": item_metadata,
                             "processing_duration_seconds": (pendulum.now('UTC') - function_start_time).total_seconds(),
                             "timestamp_utc": pendulum.now('UTC').to_iso8601_string()
@@ -1306,6 +1494,9 @@ async def main(msg: func.QueueMessage) -> None:
                             "sharepoint_custom_metadata": sharepoint_custom_metadata,
                             "sharepoint_internal_metadata": sharepoint_internal_metadata,
                             "employee_planner_tasks": employee_planner_tasks,
+                            "sharepoint_site_id": site_id,  # Include SharePoint site ID if available
+                            "m365_group_id": group_id,      # Include Microsoft 365 Group ID if available
+                            "planner_plan_id": plan_id,     # Include Planner Plan ID if available
                             "intermediate_markdown_sample": (markdown_content[:1000] + "..." if isinstance(markdown_content, str) and len(markdown_content) > 1000 else markdown_content) if markdown_content else None,
                             "dynamic_prompt": dynamic_prompt[:1000] + "..." if dynamic_prompt and len(dynamic_prompt) > 1000 else dynamic_prompt,
                             "raw_gemini_response": analysis_result.get("raw_response", None) if isinstance(analysis_result, dict) and "raw_response" in analysis_result else None,

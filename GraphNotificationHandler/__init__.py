@@ -188,15 +188,21 @@ async def process_delta_changes(
     
     # Determine content source type (SharePoint or OneDrive)
     source_type = "Unknown"
+    site_id = None
     if resource_path:
         if resource_path.startswith("sites/"):
             source_type = "SharePoint"
+            # Extract the SharePoint site ID from the resource path
+            identifiers = extract_identifiers_from_resource_path(resource_path)
+            site_id = identifiers.get("id")
         elif resource_path.startswith("drives/"):
             source_type = "OneDrive"
         elif resource_path.startswith("users/"):
             source_type = "OneDrive for Business"
     
     logging.info(f"Starting delta changes processing for {source_type} source. Resource path: {resource_path}")
+    if site_id:
+        logging.info(f"Using site ID: {site_id} for SharePoint delta changes")
 
     try:
         container_client = blob_service_client.get_container_client(DELTA_TOKEN_CONTAINER)
@@ -369,6 +375,12 @@ async def process_delta_changes(
                             "created": created_date,
                             "sourceType": source_type  # Adding the source type for context
                         }
+                        
+                        # Add siteId to the processing data if this is a SharePoint item
+                        if source_type == "SharePoint" and site_id:
+                            processing_data["siteId"] = site_id
+                            logging.info(f"Added SharePoint siteId '{site_id}' to item '{item_id}'")
+                        
                         potential_items_to_queue.append(processing_data)
 
                 # --- Check for next/delta link ---
@@ -558,8 +570,15 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                 
                 # Identify notification source type for logging
                 source_type = "Unknown"
+                site_id = None
+                
                 if resource_path.startswith("sites/"):
                     source_type = "SharePoint"
+                    # Extract the SharePoint site ID using our helper function
+                    identifiers = extract_identifiers_from_resource_path(resource_path)
+                    site_id = identifiers.get("id")
+                    if site_id:
+                        logging.info(f"Extracted SharePoint site ID from notification: {site_id}")
                     sharepoint_count += 1
                 elif resource_path.startswith("drives/"):
                     source_type = "OneDrive"
@@ -573,13 +592,19 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                 logging.info(f"Received {source_type} notification: Resource={resource_path}, SubscriptionId={subscription_id}")
                 
                 key = f"{subscription_id}:{resource_path}"
+                group_data = {
+                    "subscription_id": subscription_id,
+                    "resource_path": resource_path,
+                    "tenant_id": tenant_id,
+                    "source_type": source_type
+                }
+                
+                # Add site_id to the group data if it's a SharePoint notification
+                if source_type == "SharePoint" and site_id:
+                    group_data["site_id"] = site_id
+                
                 if key not in subscription_groups:
-                    subscription_groups[key] = {
-                        "subscription_id": subscription_id,
-                        "resource_path": resource_path,
-                        "tenant_id": tenant_id,
-                        "source_type": source_type
-                    }
+                    subscription_groups[key] = group_data
             
             # Log summary of notification types received
             logging.info(f"Notification summary: {sharepoint_count} SharePoint, {onedrive_count} OneDrive, {other_count} Other")
@@ -647,7 +672,14 @@ async def main(req: func.HttpRequest, msg: func.Out[str]) -> func.HttpResponse:
                         try:
                             item = json.loads(item_json)
                             source = item.get("sourceType", "Unknown")
-                            logging.info(f"  {idx+1}. Queuing {source} item: ID='{item.get('itemId', 'unknown')}', Name='{item.get('fileName', 'unknown')}', Tenant='{item.get('tenantId', 'unknown')}'")
+                            log_msg = f"  {idx+1}. Queuing {source} item: ID='{item.get('itemId', 'unknown')}', Name='{item.get('fileName', 'unknown')}', Tenant='{item.get('tenantId', 'unknown')}'"
+                            
+                            # Add site ID information to the log message if available
+                            if source == "SharePoint" and "siteId" in item:
+                                site_id = item.get("siteId")
+                                log_msg += f", SiteID='{site_id}'"
+                                
+                            logging.info(log_msg)
                         except Exception:
                             logging.warning(f"  {idx+1}. Could not parse queued item JSON for logging")
                             
