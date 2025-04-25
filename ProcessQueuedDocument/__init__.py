@@ -426,22 +426,53 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
         logging.info(f"Lease Lock Debug: Created lease client of type {type(lease_client)}")
         
         try:
-            # Acquire the lease using the lease client
-            lease = await lease_client.acquire(lease_duration=lease_duration)
+            # Initialize lease to None before the call
+            lease = None
+            try:
+                # Attempt to acquire the lease using the lease client
+                lease = await lease_client.acquire(lease_duration=lease_duration)
+            except AttributeError as acquire_err:
+                logging.error(f"Lease Lock: AttributeError occurred *during* lease_client.acquire: {acquire_err}", exc_info=True)
+                # Re-raise to trigger the outer fallback logic
+                raise
+            
+            # Debug logs go here
             logging.debug(f"Lease Lock DEBUG: Value of lease variable after acquire: {lease}")
             logging.debug(f"Lease Lock DEBUG: Type of lease variable after acquire: {type(lease)}")
+            
+            # Check if acquire returned None
+            if lease is None:
+                logging.error("Lease Lock: lease_client.acquire returned None unexpectedly.")
+                raise AttributeError("Lease object is None")  # Force fallback
+            
             logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' on '{blob_name}'.")
             return lease.id # Return the lease ID
+            
         except AttributeError as attr_err:
-            # Handle AttributeError in case the acquire method is not found
-            logging.error(f"Lease Lock: AttributeError when acquiring lease: {attr_err}. This might be a SDK version issue.")
+            # Handle AttributeError if it occurs after acquire returned or if inner try block re-raised
+            logging.error(f"Lease Lock: AttributeError after acquiring lease attempt: {attr_err}. This might be a SDK version issue or acquire failed.", exc_info=True)
+            
             # Fallback attempt to use blob client directly
             try:
-                lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
+                lease = None  # Initialize to None
+                try:
+                    lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
+                except AttributeError as direct_acquire_err:
+                    logging.error(f"Lease Lock: AttributeError occurred *during* lock_blob_client.acquire_lease: {direct_acquire_err}", exc_info=True)
+                    return None  # Both methods failed, return None
+                
+                # Debug logs for fallback
                 logging.debug(f"Lease Lock DEBUG: Value of lease variable after fallback acquire: {lease}")
                 logging.debug(f"Lease Lock DEBUG: Type of lease variable after fallback acquire: {type(lease)}")
+                
+                # Check if fallback acquire returned None
+                if lease is None:
+                    logging.error("Lease Lock: lock_blob_client.acquire_lease returned None unexpectedly.")
+                    return None
+                    
                 logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' using fallback method.")
                 return lease.id # Return the lease ID
+                
             except AttributeError as fallback_err:
                 logging.error(f"Lease Lock: Fallback method also failed with AttributeError: {fallback_err}")
                 return None
@@ -1034,42 +1065,59 @@ DOCUMENT CONTENT:
 
 async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str]:
     """
-    Find the Microsoft 365 Group ID associated with a SharePoint site.
-    This function parses the site_id string to extract the group ID.
+    Find the Microsoft 365 Group ID associated with a SharePoint site using Graph API.
     
     Args:
-        site_id: The SharePoint site ID, expected format: "tenant.sharepoint.com,group-id,site-id"
-        access_token: Microsoft Graph API access token (kept for backward compatibility)
+        site_id: The SharePoint site ID
+        access_token: Microsoft Graph API access token
         
     Returns:
         Optional[str]: The Group ID if found, otherwise None
     """
-    if not site_id:
-        logging.warning("Group ID: Missing required parameter - Site ID is missing")
+    if not site_id or not access_token:
+        logging.warning("Group ID: Missing required parameters - Site ID: " + 
+                     f"{'present' if site_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
         return None
     
     try:
-        logging.info(f"Group ID: Attempting to parse site ID string: {site_id}")
+        # Ensure site_id is properly encoded for URL
+        encoded_site_id = urllib.parse.quote(site_id)
+        # Direct API call to get the group associated with a site
+        graph_url = f"{GRAPH_API_ENDPOINT}/sites/{encoded_site_id}/group?$select=id"
         
-        # Check if the site_id contains commas for parsing
-        if "," in site_id:
-            # Split the site_id string using comma as delimiter
-            site_parts = site_id.split(",")
+        logging.info(f"Group ID: Querying Graph API for group associated with site: {site_id} using endpoint: {graph_url}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                graph_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30
+            )
             
-            # The group ID should be the second element (index 1) after splitting
-            if len(site_parts) >= 2:
-                group_id = site_parts[1].strip()
-                logging.info(f"Group ID: Successfully extracted group ID '{group_id}' from site ID '{site_id}'")
-                return group_id
-            else:
-                logging.warning(f"Group ID: Site ID string does not contain enough parts after splitting: {site_parts}")
+            if response.status_code == 200:
+                group_data = response.json()
+                if 'id' in group_data:
+                    group_id = group_data['id']
+                    logging.info(f"Group ID: Successfully retrieved group ID '{group_id}' for site '{site_id}'")
+                    return group_id
+                else:
+                    logging.warning(f"Group ID: Response succeeded but no ID found in data: {group_data}")
+                    return None
+            elif response.status_code == 404:
+                logging.warning(f"Group ID: Site '{site_id}' is not connected to a group (404 Not Found)")
                 return None
-        else:
-            logging.warning(f"Group ID: Site ID string does not contain commas for parsing: {site_id}")
-            return None
+            elif response.status_code == 403:
+                logging.error(f"Group ID: Insufficient permissions to access group data (403 Forbidden). "
+                              "The app may need Sites.Read.All and/or Group.Read.All permissions with Admin Consent.")
+                return None
+            else:
+                logging.error(f"Group ID: API call failed with status code {response.status_code}")
+                if response.text:
+                    logging.error(f"Group ID: Error response: {response.text[:500]}")
+                return None
                 
     except Exception as e:
-        logging.error(f"Group ID: Error parsing site ID '{site_id}': {str(e)}", exc_info=True)
+        logging.error(f"Group ID: Error retrieving group ID for site '{site_id}': {str(e)}", exc_info=True)
         return None
 
 
