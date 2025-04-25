@@ -428,6 +428,8 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
         try:
             # Acquire the lease using the lease client
             lease = await lease_client.acquire(lease_duration=lease_duration)
+            logging.debug(f"Lease Lock DEBUG: Value of lease variable after acquire: {lease}")
+            logging.debug(f"Lease Lock DEBUG: Type of lease variable after acquire: {type(lease)}")
             logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' on '{blob_name}'.")
             return lease.id # Return the lease ID
         except AttributeError as attr_err:
@@ -436,6 +438,8 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
             # Fallback attempt to use blob client directly
             try:
                 lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
+                logging.debug(f"Lease Lock DEBUG: Value of lease variable after fallback acquire: {lease}")
+                logging.debug(f"Lease Lock DEBUG: Type of lease variable after fallback acquire: {type(lease)}")
                 logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' using fallback method.")
                 return lease.id # Return the lease ID
             except AttributeError as fallback_err:
@@ -1031,52 +1035,41 @@ DOCUMENT CONTENT:
 async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str]:
     """
     Find the Microsoft 365 Group ID associated with a SharePoint site.
+    This function parses the site_id string to extract the group ID.
     
     Args:
-        site_id: The SharePoint site ID
-        access_token: Microsoft Graph API access token
+        site_id: The SharePoint site ID, expected format: "tenant.sharepoint.com,group-id,site-id"
+        access_token: Microsoft Graph API access token (kept for backward compatibility)
         
     Returns:
         Optional[str]: The Group ID if found, otherwise None
     """
-    if not site_id or not access_token:
-        logging.warning("Group ID: Missing required parameters - Site ID: " + 
-                        f"{'present' if site_id else 'missing'}, Token: {'present' if access_token else 'missing'}")
+    if not site_id:
+        logging.warning("Group ID: Missing required parameter - Site ID is missing")
         return None
     
     try:
-        # Ensure site_id is properly encoded for URL
-        encoded_site_id = urllib.parse.quote(site_id)
-        graph_url = f"{GRAPH_API_ENDPOINT}/sites/{encoded_site_id}?$select=id&$expand=group($select=id)"
+        logging.info(f"Group ID: Attempting to parse site ID string: {site_id}")
         
-        logging.info(f"Group ID: Querying Graph API for group associated with site: {site_id}")
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                graph_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=30
-            )
+        # Check if the site_id contains commas for parsing
+        if "," in site_id:
+            # Split the site_id string using comma as delimiter
+            site_parts = site_id.split(",")
             
-            if response.status_code == 200:
-                site_data = response.json()
-                group = site_data.get('group')
-                
-                if group and 'id' in group:
-                    group_id = group['id']
-                    logging.info(f"Group ID: Found group ID '{group_id}' for site '{site_id}'")
-                    return group_id
-                else:
-                    logging.warning(f"Group ID: No group associated with site '{site_id}'")
-                    return None
+            # The group ID should be the second element (index 1) after splitting
+            if len(site_parts) >= 2:
+                group_id = site_parts[1].strip()
+                logging.info(f"Group ID: Successfully extracted group ID '{group_id}' from site ID '{site_id}'")
+                return group_id
             else:
-                logging.error(f"Group ID: Failed with status code {response.status_code}")
-                if response.text:
-                    logging.error(f"Group ID: Error response: {response.text[:500]}")
+                logging.warning(f"Group ID: Site ID string does not contain enough parts after splitting: {site_parts}")
                 return None
+        else:
+            logging.warning(f"Group ID: Site ID string does not contain commas for parsing: {site_id}")
+            return None
                 
     except Exception as e:
-        logging.error(f"Group ID: Error retrieving group ID for site '{site_id}': {str(e)}", exc_info=True)
+        logging.error(f"Group ID: Error parsing site ID '{site_id}': {str(e)}", exc_info=True)
         return None
 
 
