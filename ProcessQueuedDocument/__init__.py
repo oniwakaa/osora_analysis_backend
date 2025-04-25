@@ -48,7 +48,7 @@ IDEMPOTENCY_WINDOW_MINUTES = int(os.environ.get("IDEMPOTENCY_WINDOW_MINUTES", "1
 # Google Generative AI configuration for both models
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GEMINI_PROMPT_MODEL = os.environ.get("GEMINI_PROMPT_MODEL", "gemini-1.5-flash-latest")
-GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-1.5-pro-latest")
+GEMINI_ANALYSIS_MODEL = os.environ.get("GEMINI_ANALYSIS_MODEL", "gemini-2.0-flash")
 
 # --- Global Clients ---
 credential: Optional[DefaultAzureCredential] = None
@@ -653,8 +653,9 @@ async def get_employee_planner_tasks(plan_id: Optional[str], user_id: str, acces
         return []
     
     try:
-        # Construct API URL for the specific plan and expand details and assignments
-        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}/tasks?$expand=details,assignments"
+        # Construct API URL for the specific plan and expand only details
+        # The assignments information is included in the default task response
+        tasks_url = f"{GRAPH_API_ENDPOINT}/planner/plans/{plan_id}/tasks?$expand=details"
         logging.info(f"Planner Tasks: Querying Graph API for tasks in plan: {plan_id}")
         
         async with httpx.AsyncClient() as client:
@@ -673,6 +674,7 @@ async def get_employee_planner_tasks(plan_id: Optional[str], user_id: str, acces
                 
                 for task in tasks:
                     # Get assignments dictionary, default to empty
+                    # This works without $expand=assignments as assignments is included in the default response
                     assignments = task.get('assignments', {})
                     
                     # Only include tasks where user_id is a direct key in the assignments dictionary
@@ -999,7 +1001,7 @@ DOCUMENT CONTENT:
             logging.info("Gemini Analysis: Successfully parsed JSON response.")
             
             # Validate required keys
-            required_keys = ["summary", "technical_scores", "content_analysis", "recommendations"]
+            required_keys = ["descriptive_summary", "technical_summary", "technical_scores", "recommendations"]
             if all(key in json_match for key in required_keys):
                 # Remove metadata if present - we don't want it
                 if "metadata" in json_match:
