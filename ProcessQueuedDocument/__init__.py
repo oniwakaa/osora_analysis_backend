@@ -387,7 +387,8 @@ async def extract_markdown_with_doc_intelligence(file_content_bytes: bytes) -> s
 async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_name: str, blob_name: str, lease_duration: int) -> Optional[str]:
     """
     Attempts to acquire a lease on a blob, creating the blob if it doesn't exist.
-    Returns the lease ID if successful, None otherwise.
+    Returns the lease ID if successful, "ACQUIRED_BUT_NO_ID" if acquisition likely succeeded but no ID was returned, 
+    or None if acquisition failed.
     """
     if not blob_service_client:
         logging.error(f"Lease Lock: Blob service client not available for blob {blob_name}.")
@@ -425,47 +426,29 @@ async def acquire_blob_lease(blob_service_client: BlobServiceClient, container_n
         lease_client = BlobLeaseClient(client=lock_blob_client)
         logging.info(f"Lease Lock Debug: Created lease client of type {type(lease_client)}")
         
-        try:
-            # Initialize lease to None before the call
-            lease = None
-            
-            # Log before attempting to acquire lease
-            logging.info("Lease Lock: >>> Attempting lease_client.acquire")
-            
-            # Attempt to acquire the lease using the lease client
-            lease = await lease_client.acquire(lease_duration=lease_duration)
-            
-            # Debug logs go here
-            logging.debug(f"Lease Lock DEBUG: Value of lease variable after acquire: {lease}")
-            logging.debug(f"Lease Lock DEBUG: Type of lease variable after acquire: {type(lease)}")
-            
-            logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' on '{blob_name}'.")
-            return lease.id # Return the lease ID
-            
-        except AttributeError as attr_err:
-            # Handle AttributeError if it occurs after acquire returned or if inner try block re-raised
-            logging.error(f"Lease Lock: AttributeError when attempting lease: {attr_err}. This might be a SDK version issue.", exc_info=True)
-            
-            # Fallback attempt to use blob client directly
-            try:
-                # Log before attempting fallback acquire
-                logging.info("Lease Lock: >>> Attempting fallback lock_blob_client.acquire_lease")
-                
-                lease = await lock_blob_client.acquire_lease(lease_duration=lease_duration)
-                
-                # Debug logs for fallback
-                logging.debug(f"Lease Lock DEBUG: Value of lease variable after fallback acquire: {lease}")
-                logging.debug(f"Lease Lock DEBUG: Type of lease variable after fallback acquire: {type(lease)}")
-                
-                logging.info(f"Lease Lock: Successfully acquired lease '{lease.id}' using fallback method.")
-                return lease.id # Return the lease ID
-                
-            except AttributeError as fallback_err:
-                logging.error(f"Lease Lock: Fallback method also failed with AttributeError: {fallback_err}", exc_info=True)
-                return None
-            except Exception as fallback_ex:
-                logging.error(f"Lease Lock: Fallback attempt failed: {fallback_ex}", exc_info=True)
-                return None
+        # Log before attempting to acquire lease
+        logging.info("Lease Lock: >>> Attempting lease_client.acquire")
+        
+        # Attempt to acquire the lease using the lease client
+        lease = await lease_client.acquire(lease_duration=lease_duration)
+        
+        # Debug logs go here
+        logging.debug(f"Lease Lock DEBUG: Value of lease variable after acquire: {lease}")
+        logging.debug(f"Lease Lock DEBUG: Type of lease variable after acquire: {type(lease)}")
+        
+        # Check if acquire returned None despite likely success
+        if lease is None:
+            logging.warning(f"Lease Lock: acquire() returned None but likely succeeded for '{blob_name}'. Returning special indicator.")
+            return "ACQUIRED_BUT_NO_ID" 
+        else:
+            # Handle the case where it returns a valid object
+            actual_lease_id = getattr(lease, 'id', None) # Safely get id attribute
+            if actual_lease_id:
+                logging.info(f"Lease Lock: Successfully acquired lease '{actual_lease_id}' on '{blob_name}'.")
+                return actual_lease_id
+            else:
+                logging.error(f"Lease Lock: acquire() returned an object without an 'id': {lease}")
+                return None # Indicate failure if object has no id
 
     except HttpResponseError as ex:
         if ex.status_code == 409: # Conflict - Lease already present
@@ -487,6 +470,21 @@ async def release_blob_lease(blob_service_client: BlobServiceClient, container_n
     if not lease_id:
         logging.error(f"Lease Lock: No lease ID provided for releasing lease on {blob_name}.")
         return
+    
+    # Handle the special case where acquire returned None but likely succeeded
+    if lease_id == "ACQUIRED_BUT_NO_ID":
+        logging.warning(f"Lease Lock: Attempting to break lease on '{blob_name}' without specific ID (acquire returned None).")
+        try:
+            lock_blob_client = blob_service_client.get_blob_client(container_name, blob_name)
+            # Break lease immediately
+            await lock_blob_client.break_lease(lease_break_period=0) 
+            logging.info(f"Lease Lock: Successfully initiated break for lease on '{blob_name}'.")
+        except Exception as break_err:
+            logging.error(f"Lease Lock: Error attempting to break lease without ID for '{blob_name}': {break_err}", exc_info=True)
+        finally:
+            return # Exit function after attempting break
+    
+    # --- The original logic for releasing a known lease ID starts below ---
     
     try:
         # Get the blob client first
@@ -1053,14 +1051,14 @@ DOCUMENT CONTENT:
 async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str]:
     """
     Find the Microsoft 365 Group ID associated with a SharePoint site using Graph API.
-    This implementation extracts the siteCollectionId from the site's sharepointIds.
+    This implementation extracts the group ID from the site's drive owner.
     
     Args:
         site_id: The SharePoint site ID
         access_token: Microsoft Graph API access token
         
     Returns:
-        Optional[str]: The Group ID (siteCollectionId) if found, otherwise None
+        Optional[str]: The Group ID if found, otherwise None
     """
     if not site_id or not access_token:
         logging.warning("Group ID: Missing required parameters - Site ID: " + 
@@ -1070,10 +1068,10 @@ async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str
     try:
         # Ensure site_id is properly encoded for URL
         encoded_site_id = urllib.parse.quote(site_id)
-        # Request the site with sharepointIds field
-        graph_url = f"{GRAPH_API_ENDPOINT}/sites/{encoded_site_id}?$select=id,sharepointIds"
+        # Get the drive owner which should be the group for group-connected sites
+        graph_url = f"{GRAPH_API_ENDPOINT}/sites/{encoded_site_id}/drive?$select=owner"
         
-        logging.info(f"Group ID: Querying Graph API for site sharepointIds: {site_id} using endpoint: {graph_url}")
+        logging.info(f"Group ID: Querying Graph API for site drive owner: {site_id} using endpoint: {graph_url}")
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -1083,23 +1081,23 @@ async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str
             )
             
             if response.status_code == 200:
-                site_data = response.json()
-                # Extract sharepointIds from the response
-                sharepoint_ids = site_data.get('sharepointIds', {})
-                # Get the siteCollectionId which can be used as a group identifier
-                group_id = sharepoint_ids.get('siteCollectionId')
+                drive_data = response.json()
+                # Extract group ID from drive owner
+                owner_info = drive_data.get('owner', {})
+                group_info = owner_info.get('group', {})
+                group_id = group_info.get('id')
                 
                 if group_id:
-                    logging.info(f"Group ID: Extracted siteCollectionId '{group_id}' from sharepointIds.")
+                    logging.info(f"Group ID: Extracted group ID '{group_id}' from drive owner.")
                     return group_id
                 else:
-                    logging.warning("Group ID: sharepointIds or siteCollectionId not found in site resource response.")
+                    logging.warning("Group ID: drive owner is not a group or Group ID is missing in the response.")
                     return None
             elif response.status_code == 404:
-                logging.warning(f"Group ID: Site '{site_id}' not found (404 Not Found)")
+                logging.warning(f"Group ID: Site '{site_id}' not found or has no drive (404 Not Found)")
                 return None
             elif response.status_code == 403:
-                logging.error(f"Group ID: Insufficient permissions to access site data (403 Forbidden). "
+                logging.error(f"Group ID: Insufficient permissions to access site drive (403 Forbidden). "
                               "The app may need Sites.Read.All permissions with Admin Consent.")
                 return None
             else:
@@ -1109,7 +1107,7 @@ async def get_group_id_for_site(site_id: str, access_token: str) -> Optional[str
                 return None
                 
     except Exception as e:
-        logging.error(f"Group ID: Error retrieving site data for site '{site_id}': {str(e)}", exc_info=True)
+        logging.error(f"Group ID: Error retrieving site drive data for site '{site_id}': {str(e)}", exc_info=True)
         return None
 
 
