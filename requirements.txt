@@ -209,3 +209,5 @@ pendulum==3.0.0
 tiktoken==0.9.0
 anthropic==0.49.0
 google-generativeai==0.8.5
+pyodbc==5.2.0
+pyarrow==19.0.1

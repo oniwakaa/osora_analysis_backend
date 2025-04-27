@@ -32,5 +32,9 @@
   },
   "watchDirectories": [
     "utils"
-  ]
-} 
+  ],
+  "concurrency": {
+    "dynamicConcurrencyEnabled": true,
+    "snapshotPersistenceEnabled": true
+  }
+}
