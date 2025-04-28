@@ -814,57 +814,68 @@ These are the current planner tasks assigned to the document author/owner. Use t
         meta_prompt = f"""
             Prompt Designer Instructions:
 
-            Your task is to generate a highly specific, context-aware prompt that will guide a final AI model to analyze a single working document (Word, Excel, PowerPoint, or PDF). This final prompt must instruct the AI to produce an output that is structured, objective, and sharply aligned with the document type, its content, and the full set of provided metadata (e.g., deadline, project context, review status, feedback history, document objective).
+                Your task is to generate a highly specific, context-aware prompt that will guide a final AI model to analyze a single working document (Word, Excel, PowerPoint, or PDF). This final prompt must instruct the AI to produce an output that is structured, objective, and sharply aligned with the document type, its content, and the full set of provided metadata (e.g., deadline, project context, review status, feedback history, document objective).
 
-            You are not creating a one-size-fits-all prompt. You are designing a precise and tailored instruction set that forces the final AI to analyze the document in depth and in context. Your output must ensure the final AI adapts its language, scoring criteria, and recommendations to suit the specific nature and function of the document.
+                You are not creating a one-size-fits-all prompt. You are designing a precise and tailored instruction set that forces the final AI to analyze the document in depth and in context. Your output must ensure the final AI adapts its language, scoring criteria, and recommendations to suit the specific nature and function of the document.
 
-            Requirements for the Final Prompt You Will Generate:
-            Output Format:
+                Requirements for the Final Prompt You Will Generate:
+                Output Format:
 
-            Instruct the final AI to output only a structured JSON object.
+                Instruct the final AI to output only a structured JSON object.
 
-            The JSON must start with {{ and end with }} — absolutely no text before or after.
+                The JSON must start with {{ and end with }} — absolutely no text before or after.
 
-            No markdown, no formatting, no headings. Just raw JSON.
+                No markdown, no formatting, no headings. Just raw JSON.
 
-            Top-Level JSON Keys (MANDATORY STRUCTURE):
+                Top-Level JSON Keys (MANDATORY STRUCTURE):
 
-            "descriptive_summary": 5–7 objective sentences describing the document's purpose, content, and key points. Must remain neutral and not evaluative.
+                "descriptive_summary": 5–7 objective sentences describing the document's purpose, content, and key points. Must remain neutral and not evaluative.
 
-            "technical_summary": 3–5 sentences critically evaluating the quality and effectiveness of the document, based on its type and intended function.
+                "technical_summary": 3–5 sentences critically evaluating the quality and effectiveness of the document, based on its type and intended function.
 
-            "technical_scores": Exactly 5 metrics scored on a 1–10 scale, with brief, targeted justifications. These metrics must be document-type-specific (see below).
+                # --- START MODIFICATION ---
+                "technical_scores": A JSON object containing EXACTLY the following 5 keys: "Clarity", "Evidence", "Logic", "Style", "Depth". 
+                - Each key MUST map to a nested JSON object containing exactly two keys:
+                    - "score": An integer score from 1 to 10.
+                    - "justification": A brief (1-2 sentence) string explaining the reason for the score, directly referencing the document content or context.
+                - Adapt the *meaning* of these 5 metrics based on the document type (Excel, Word, PowerPoint, PDF) as described in the 'Scoring Metric Guidelines' below, but ALWAYS use these exact 5 keys ("Clarity", "Evidence", "Logic", "Style", "Depth") in the output JSON structure.
 
-            "recommendations": 2–3 clear, actionable suggestions to improve the document. These should reflect both its type and the project/review context found in the metadata.
+                Example structure for technical_scores:
+                "technical_scores": {
+                "Clarity": { "score": 8, "justification": "The main arguments are clearly presented in section 2." },
+                "Evidence": { "score": 6, "justification": "Supporting data is present but could be more recent." },
+                "Logic": { "score": 7, "justification": "The flow is generally logical, though paragraph 3 jumps topic slightly." },
+                "Style": { "score": 9, "justification": "Professional tone and appropriate language used throughout." },
+                "Depth": { "score": 5, "justification": "The analysis covers the basics but lacks deeper insights into market implications." }
+                }
+                # --- END MODIFICATION ---
 
-            Scoring Metric Guidelines (adapt based on document type):
+                "recommendations": 2–3 clear, actionable suggestions to improve the document. These should reflect both its type and the project/review context found in the metadata.
 
-            Excel/Data-Heavy (.xlsx):
-            "Data Accuracy/Integrity", "Formula Complexity/Efficiency", "Clarity of Presentation (Charts/Tables)", "Structural Organization", "Actionability of Data"
+                Scoring Metric Guidelines (adapt *meaning* based on document type, but use the fixed keys above):
 
-            Word/Analytical Reports (.docx):
-            "Logical Structure/Flow", "Clarity of Argument", "Evidence Quality/Support", "Depth of Analysis", "Writing Style/Professionalism"
+                Excel/Data-Heavy (.xlsx): Relate 'Clarity' to presentation, 'Evidence' to data accuracy, 'Logic' to structure/formulas, 'Style' to formatting, 'Depth' to actionability.
 
-            PowerPoint/Presentations (.pptx):
-            "Visual Design/Appeal", "Clarity of Key Messages", "Slide Structure/Flow", "Audience Appropriateness", "Information Density"
+                Word/Analytical Reports (.docx): Relate 'Clarity' to argument, 'Evidence' to support quality, 'Logic' to structure/flow, 'Style' to writing, 'Depth' to analysis depth.
 
-            PDF or Mixed-Type Documents:
-            Instruct the AI to choose 4–5 metrics most relevant to the content and context — e.g., formatting quality, clarity, usability, analytical depth, etc.
+                PowerPoint/Presentations (.pptx): Relate 'Clarity' to key messages, 'Evidence' to support on slides, 'Logic' to flow/structure, 'Style' to visual design, 'Depth' to information density/audience fit.
 
-            Alignment with Metadata Context:
+                PDF or Mixed-Type Documents: Apply the 5 metrics ('Clarity', 'Evidence', 'Logic', 'Style', 'Depth') as seems most relevant to the content and context.
 
-            Instruct the final AI to incorporate metadata into all evaluative components — especially the "technical_summary" and "recommendations".
+                Alignment with Metadata Context:
 
-            If a document is part of a draft cycle, under review, or linked to a specific deadline or objective, this must directly influence the tone and content of the evaluation.
+                Instruct the final AI to incorporate metadata into all evaluative components — especially the "technical_summary" and "recommendations".
 
-            Scoring should reflect expectations based on the document's stage, role, and use-case in the project.
+                If a document is part of a draft cycle, under review, or linked to a specific deadline or objective, this must directly influence the tone and content of the evaluation.
 
-            Enforcement of Strict Format Compliance:
+                Scoring should reflect expectations based on the document's stage, role, and use-case in the project.
 
-            Reinforce that any deviation from the defined JSON structure, or inclusion of additional text, invalidates the output.
+                Enforcement of Strict Format Compliance:
 
-            Your Output:
-            Generate a targeted and context-aware prompt that includes all the above constraints, tailored to the specific document type and the full metadata. It should push the final AI to deliver a precise, useful, and context-grounded evaluation, not a generic assessment.
+                Reinforce that any deviation from the defined JSON structure (including the exact keys and structure within "technical_scores"), or inclusion of additional text, invalidates the output.
+
+                Your Output:
+                Generate a targeted and context-aware prompt that includes all the above constraints, tailored to the specific document type and the full metadata. It should push the final AI to deliver a precise, useful, and context-grounded evaluation, not a generic assessment.
         """
         
         logging.info(f"Gemini: Generating dynamic prompt for {file_type} document with custom metadata: {len(sharepoint_custom_metadata) if sharepoint_custom_metadata else 0} fields and {len(employee_planner_tasks) if employee_planner_tasks else 0} planner tasks")

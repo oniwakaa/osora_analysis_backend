@@ -28,8 +28,13 @@ DOCUMENT_SCHEMA = [
     "TenantID", "ItemID_SP", "file_name", "file_extension", "URLDocumento", 
     "AutoreNome", "Modified_Date", "CodiceProgetto", "DateCreated_SP", 
     "Deadline", "DataRevisione", "StatoRevisione", "Priority", "ReviewFeedback",
-    "descriptive_summary", "technical_summary", "ScoreClarityAI", "ScoreEvidenceAI",
-    "ScoreLogicAI", "ScoreStyleAI", "ScoreDepthAI", "recommendations", "DataAnalisiUTC",
+    "descriptive_summary", "technical_summary", 
+    "ScoreClarityAI", "JustificationClarityAI",
+    "ScoreEvidenceAI", "JustificationEvidenceAI",
+    "ScoreLogicAI", "JustificationLogicAI",
+    "ScoreStyleAI", "JustificationStyleAI",
+    "ScoreDepthAI", "JustificationDepthAI",
+    "recommendations", "DataAnalisiUTC",
     "sharepoint_site_id", "m365_group_id", "planner_plan_id"
 ]
 
@@ -62,15 +67,6 @@ DOC_FIELD_MAPPING = {
     "sharepoint_site_id": ["sharepoint_site_id"],
     "m365_group_id": ["m365_group_id"],
     "planner_plan_id": ["planner_plan_id"]
-}
-
-# Mapping variations for AI score fields
-AI_SCORE_KEY_MAP = {
-    "ScoreClarityAI": ["Clarity of Argument", "Clarity", "Chiarezza"],
-    "ScoreEvidenceAI": ["Evidence Quality/Support", "Evidence", "Supporto Prove"],
-    "ScoreLogicAI": ["Logical Structure/Flow", "Logic", "Structure", "Logica"],
-    "ScoreStyleAI": ["Writing Style/Professionalism", "Style", "Stile"],
-    "ScoreDepthAI": ["Depth of Analysis", "Depth", "Profondità Analisi"]
 }
 
 # Field mappings for task data (paths within task object)
@@ -112,38 +108,45 @@ async def main(event: func.EventGridEvent):
         event_data = event.get_json()
         if event_data is None:
             logging.error("Event data is None or empty")
-            raise ValueError("Invalid event data: empty or None")
+            return
             
         logging.info(f"Received Event Grid event: {json.dumps(event_data, indent=2)}")
         
-        # Extract blob URL from event data
-        blob_url = event_data.get('data', {}).get('url')
+        # Extract blob URL from event data - directly at top level (standard for blob events)
+        blob_url = event_data.get('url') or event_data.get('blobUrl') 
+        
+        # --- ADD FILTERING ---
         if not blob_url:
-            error_msg = "No blob URL found in event data"
-            logging.error(error_msg)
-            raise ValueError(error_msg)
+            logging.error("Event data does not contain a 'url' or 'blobUrl'. Skipping.")
+            # Returning None or completing gracefully is usually better than raising an error for non-matching events
+            return 
+
+        # Parse the URL to check the container and file extension
+        try:
+            parsed_url = urlparse(blob_url)
+            path_parts = parsed_url.path.lstrip('/').split('/')
+            if len(path_parts) < 2:
+                logging.warning(f"Could not parse container/blob name from URL: {blob_url}. Skipping.")
+                return
+
+            container_name = path_parts[0]
+            blob_name = '/'.join(path_parts[1:])
+
+            # Check if the blob is in the expected container and has a .json extension
+            if container_name != INPUT_CONTAINER_NAME:
+                logging.info(f"Ignoring event for blob in container '{container_name}'. Expected '{INPUT_CONTAINER_NAME}'.")
+                return
+            if not blob_name.lower().endswith('.json'):
+                logging.info(f"Ignoring event for non-JSON blob: {blob_name}")
+                return
+
+            logging.info(f"Processing relevant blob event for: {container_name}/{blob_name}")
+
+        except Exception as parse_err:
+            logging.error(f"Error parsing blob URL '{blob_url}' for filtering: {parse_err}. Skipping event.", exc_info=True)
+            return
+        # --- END FILTERING ---
             
-        logging.info(f"Processing blob from URL: {blob_url}")
-        
-        # Parse blob URL to get container and blob name
-        parsed_url = urlparse(blob_url)
-        path_parts = parsed_url.path.lstrip('/').split('/')
-        if len(path_parts) < 2:
-            error_msg = f"Invalid blob URL format: {blob_url}"
-            logging.error(error_msg)
-            raise ValueError(error_msg)
-            
-        container_name = path_parts[0]
-        blob_name = '/'.join(path_parts[1:])
-        
-        # Verify the container name matches expected input container
-        if container_name != INPUT_CONTAINER_NAME:
-            warning_msg = f"Container name '{container_name}' does not match expected input container '{INPUT_CONTAINER_NAME}'"
-            logging.warning(warning_msg)
-            # Continue processing but log the warning
-        
-        logging.info(f"Extracted container: {container_name}, blob: {blob_name}")
-        
         # Initialize Azure credential
         credential = DefaultAzureCredential()
         
@@ -162,19 +165,19 @@ async def main(event: func.EventGridEvent):
             except ResourceNotFoundError as e:
                 error_msg = f"Blob not found: {container_name}/{blob_name}"
                 logging.error(error_msg)
-                raise ValueError(error_msg) from e
+                return
             except HttpResponseError as e:
                 error_msg = f"HTTP error accessing blob: {container_name}/{blob_name}. Status: {e.status_code}, Reason: {e.reason}"
                 logging.error(error_msg)
-                raise ValueError(error_msg) from e
+                return
             except json.JSONDecodeError as e:
                 error_msg = f"Failed to parse JSON from blob {container_name}/{blob_name}: {str(e)}"
                 logging.error(error_msg)
-                raise ValueError(error_msg) from e
+                return
             except Exception as e:
                 error_msg = f"Error reading blob content from {container_name}/{blob_name}: {str(e)}"
                 logging.error(error_msg)
-                raise
+                return
             
             # Extract key identifiers
             tenant_id = get_nested_value(parsed_data, ["metadata", "tenant_id"]) or \
@@ -233,7 +236,7 @@ async def main(event: func.EventGridEvent):
                 logging.info(f"Tenant {tenant_id}, Item {item_id}: Document data successfully written")
             except Exception as e:
                 logging.error(f"Tenant {tenant_id}, Item {item_id}: Failed to write document data: {str(e)}", exc_info=True)
-                raise
+                return
             
             # Write tasks DataFrame to Parquet if not empty
             if not df_tasks.empty:
@@ -248,13 +251,12 @@ async def main(event: func.EventGridEvent):
                     logging.info(f"Tenant {tenant_id}, Item {item_id}: Task data successfully written")
                 except Exception as e:
                     logging.error(f"Tenant {tenant_id}, Item {item_id}: Failed to write task data: {str(e)}", exc_info=True)
-                    raise
+                    return
             else:
                 logging.info(f"Tenant {tenant_id}, Item {item_id}: No task data to write")
                 
     except Exception as e:
         logging.error(f"Error processing event: {str(e)}", exc_info=True)
-        raise
     finally:
         logging.info("Completed processing of event")
 
@@ -346,32 +348,38 @@ def extract_document_data(data: Dict[str, Any], tenant_id: str, item_id: str, bl
         except Exception as e:
             logging.warning(f"Tenant {tenant_id}, Item {item_id}: Error extracting field {target_field}: {str(e)}")
     
-    # Process AI scores with mapping variations
-    logging.info(f"Tenant {tenant_id}, Item {item_id}: Processing AI scores...")
+    # --- START MODIFIED SCORE PROCESSING ---
+    logging.info(f"Tenant {tenant_id}, Item {item_id}: Processing fixed AI scores...")
     scores_dict = get_nested_value(data, ["analysis_output", "technical_scores"], {})
-    
+
+    # Define the fixed keys expected from the updated prompt
+    fixed_score_keys = {
+        "Clarity": ("ScoreClarityAI", "JustificationClarityAI"),
+        "Evidence": ("ScoreEvidenceAI", "JustificationEvidenceAI"),
+        "Logic": ("ScoreLogicAI", "JustificationLogicAI"),
+        "Style": ("ScoreStyleAI", "JustificationStyleAI"),
+        "Depth": ("ScoreDepthAI", "JustificationDepthAI")
+    }
+
     if isinstance(scores_dict, dict):
-        # Iterate through the TARGET columns we want to populate
-        for target_col, possible_keys in AI_SCORE_KEY_MAP.items():
-            score_found = False
-            # Try each possible key for the current target column
-            for json_key in possible_keys:
-                if json_key in scores_dict:
-                    # Found a matching key in the JSON
-                    score_value = get_nested_value(scores_dict, [json_key, "score"])
-                    doc_data[target_col] = score_value # Assign to the target column
-                    score_found = True
-                    logging.debug(f"Tenant {tenant_id}, Item {item_id}: Mapped JSON key '{json_key}' to target column '{target_col}' with value {score_value}")
-                    break # Stop searching for other keys for this target column
-    
-            if not score_found:
-                logging.warning(f"Tenant {tenant_id}, Item {item_id}: Could not find any matching key in JSON ({list(scores_dict.keys())}) for target score column '{target_col}' using possible keys {possible_keys}. Setting to None.")
-                doc_data[target_col] = None # Ensure it's None if no key matched
+        for key, (score_col, just_col) in fixed_score_keys.items():
+            score_data = scores_dict.get(key) # Get the nested object for the key
+            if isinstance(score_data, dict):
+                doc_data[score_col] = score_data.get("score")
+                doc_data[just_col] = score_data.get("justification")
+                logging.debug(f"Tenant {tenant_id}, Item {item_id}: Extracted score/justification for key '{key}'")
+            else:
+                # Log if the expected key or its nested structure is missing
+                logging.warning(f"Tenant {tenant_id}, Item {item_id}: Expected score data for key '{key}' not found or not a dict in technical_scores. Setting {score_col} and {just_col} to None.")
+                doc_data[score_col] = None
+                doc_data[just_col] = None
     else:
-        logging.warning(f"Tenant {tenant_id}, Item {item_id}: 'analysis_output.technical_scores' is not a dictionary or is missing. Skipping score extraction.")
-        # Ensure all target score columns are None if the scores_dict is invalid
-        for target_col in AI_SCORE_KEY_MAP.keys():
-            doc_data[target_col] = None
+        logging.warning(f"Tenant {tenant_id}, Item {item_id}: 'analysis_output.technical_scores' is not a dictionary or is missing. Skipping all score extraction.")
+        # Ensure all score and justification columns are None
+        for score_col, just_col in fixed_score_keys.values():
+             doc_data[score_col] = None
+             doc_data[just_col] = None
+    # --- END MODIFIED SCORE PROCESSING ---
     
     return doc_data
 
@@ -459,11 +467,14 @@ def apply_document_types(df: pd.DataFrame, tenant_id: str, item_id: str) -> pd.D
             "TenantID", "ItemID_SP", "file_name", "file_extension", "URLDocumento", 
             "AutoreNome", "CodiceProgetto", "StatoRevisione", "Priority", "ReviewFeedback",
             "descriptive_summary", "technical_summary", "recommendations",
-            "sharepoint_site_id", "m365_group_id", "planner_plan_id"
+            "sharepoint_site_id", "m365_group_id", "planner_plan_id",
+            "JustificationClarityAI", "JustificationEvidenceAI", "JustificationLogicAI", 
+            "JustificationStyleAI", "JustificationDepthAI"
         ]
         for field in string_fields:
-            # Only convert non-None values to string
-            df[field] = df[field].apply(lambda x: str(x) if x is not None else None)
+            if field in df.columns: # Check if column exists before applying
+                # Only convert non-None values to string
+                df[field] = df[field].apply(lambda x: str(x) if x is not None else None)
     
     except Exception as e:
         logging.warning(f"Tenant {tenant_id}, Item {item_id}: Error applying document data types: {str(e)}")
