@@ -2,11 +2,9 @@
   "scriptFile": "__init__.py",
   "bindings": [
     {
-      "name": "myblob",
-      "type": "EventGridTrigger",
-      "direction": "in",
-      "path": "analysis-results/{name}",
-      "connection": "AzureWebJobsStorage"
+      "type": "eventGridTrigger",
+      "name": "event", 
+      "direction": "in"
     }
   ]
 }
